@@ -55,8 +55,8 @@ volatile bool imu_data_ready = false;
 // Right leg goes backward at 0 degrees (500us), forward at 180 degrees (2500us).
 // Left leg goes forward at 0 degrees (500us), backward at 180 degrees (2500us).
 const float SERVO_DIRS[ACTION_DIM] = {
-    1.0f, 1.0f, 1.0f,   // Right Leg
-    -1.0f, -1.0f, -1.0f // Left Leg (Inverted)
+    -1.0f, -1.0f, -1.0f, // Left Leg (Inverted)
+    1.0f, 1.0f, 1.0f     // Right Leg
 };
 
 // 90 degrees corresponds perfectly to 1500us based on your script
