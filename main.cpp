@@ -328,15 +328,12 @@ void update_observation_buffer(const float *new_action)
 }
 
 // --- Main Control Loop (50Hz) ---
-
-// 2. Shrink the timer callback to do absolutely nothing but flip the flag
 bool control_loop_callback(struct repeating_timer *t)
 {
     run_control_step = true;
     return true; // Keep timer repeating
 }
 
-// 3. Move all the heavy logic into your main() function
 int main()
 {
     stdio_init_all();
@@ -345,12 +342,30 @@ int main()
     init_imu();
     init_servos();
 
+    // 1. Force all actions to 0.0f (Center position)
+    for (int i = 0; i < ACTION_DIM; i++)
+    {
+        target_actions[i] = 0.0f;
+    }
+
+    // 2. Send the center command to the servos immediately
+    update_servos(target_actions);
+
+    // 3. The 10-Second Countdown
+    printf("\nServos locked at center. Place the robot on the ground!\n");
+    for (int i = 10; i > 0; i--)
+    {
+        printf("Starting in %d...\n", i);
+        sleep_ms(1000); // Sleep for 1 second
+    }
+    printf("GO!\n\n");
+
+    // 4. Initialize the observation buffer before the loop starts
     update_observation_buffer(target_actions);
 
+    // 5. Start the 50Hz (20ms) hardware timer flag generator
     struct repeating_timer timer;
     add_repeating_timer_us(-20000, control_loop_callback, NULL, &timer);
-
-    printf("Control loop running.\n");
 
     float gx, gy, gz, ax, ay, az;
 
@@ -359,33 +374,26 @@ int main()
     {
         if (run_control_step)
         {
-            run_control_step = false; // Reset the flag immediately
+            run_control_step = false;
 
-            // 1. Read IMU (Blocking SPI is safe here)
             read_imu(&gx, &gy, &gz, &ax, &ay, &az);
-
-            // 2. Update Filter and extract gravity
             madgwick_update_6dof(gx, gy, gz, ax, ay, az, 0.02f);
             get_local_gravity(&current_obs[240]);
 
-            // 3. Run Neural Network Forward Pass (Math is safe here)
             infer_action(current_obs, target_actions);
 
-            // 4. Send to physical servos
             update_servos(target_actions);
 
-            // 5. Update history buffer
             update_observation_buffer(target_actions);
 
             step_counter++;
 
-            // printf("Step: %d | Action 0: %.2f\n", step_counter, target_actions[0]);
-
-            // // Optional: Print to verify the loop is actually surviving!
-            // printf("Step: %d | Pitch (Gravity Y): %.2f\n", step_counter, current_obs[241]);
+            // // Optional diagnostic print (runs once per second)
+            // if (step_counter % 50 == 0)
+            // {
+            //     printf("Step %d | Executing Policy...\n", step_counter);
+            // }
         }
-
-        // When the math is done, the CPU loops here instantly until the next 20ms tick
         tight_loop_contents();
     }
     return 0;
