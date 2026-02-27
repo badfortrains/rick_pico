@@ -22,7 +22,7 @@
 #define PIN_MOSI 11
 
 // Servo Pins (Adjust to match where you plugged in your 6 servos)
-const uint SERVO_PINS[ACTION_DIM] = {2, 3, 4, 5, 6, 7};
+const uint SERVO_PINS[ACTION_DIM] = {4, 3, 2, 7, 5, 6};
 
 // IMU Registers & Scaling
 #define CTRL1_XL 0x10
@@ -77,8 +77,10 @@ inline float swish(float x)
     return x / (1.0f + std::exp(-x));
 }
 
-void normalize_obs(const float* raw_obs, float* norm_obs) {
-    for (int i = 0; i < OBS_DIM; ++i) {
+void normalize_obs(const float *raw_obs, float *norm_obs)
+{
+    for (int i = 0; i < OBS_DIM; ++i)
+    {
         // Brax already computed the standard deviation (with epsilon) for us.
         // Subtract the mean, divide by the std. No slow square roots needed!
         norm_obs[i] = (raw_obs[i] - OBS_MEAN[i]) / OBS_STD[i];
@@ -377,10 +379,10 @@ int main()
 
             step_counter++;
 
-            printf("Step: %d | Action 0: %.2f\n", step_counter, target_actions[0]);
+            // printf("Step: %d | Action 0: %.2f\n", step_counter, target_actions[0]);
 
             // // Optional: Print to verify the loop is actually surviving!
-            printf("Step: %d | Pitch (Gravity Y): %.2f\n", step_counter, current_obs[241]);
+            // printf("Step: %d | Pitch (Gravity Y): %.2f\n", step_counter, current_obs[241]);
         }
 
         // When the math is done, the CPU loops here instantly until the next 20ms tick
