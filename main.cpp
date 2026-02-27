@@ -9,13 +9,13 @@
 
 // --- Configuration & Constants ---
 #define OBS_DIM 245
-#define HIDDEN_DIM 256
+#define HIDDEN_DIM 32
 #define ACTION_DIM 6
 #define HISTORY_LEN 40
 #define HISTORY_DIM (HISTORY_LEN * ACTION_DIM) // 240
 
 // SPI & LSM6DSO Pins (Adjust these to match your wiring!)
-#define SPI_PORT spi0
+#define SPI_PORT spi1
 #define PIN_MISO 8
 #define PIN_CS 9
 #define PIN_SCK 10
@@ -77,11 +77,11 @@ inline float swish(float x)
     return x / (1.0f + std::exp(-x));
 }
 
-void normalize_obs(const float *raw_obs, float *norm_obs)
-{
-    for (int i = 0; i < OBS_DIM; ++i)
-    {
-        norm_obs[i] = (raw_obs[i] - OBS_MEAN[i]) / std::sqrt(OBS_VAR[i] + 1e-8f);
+void normalize_obs(const float* raw_obs, float* norm_obs) {
+    for (int i = 0; i < OBS_DIM; ++i) {
+        // Brax already computed the standard deviation (with epsilon) for us.
+        // Subtract the mean, divide by the std. No slow square roots needed!
+        norm_obs[i] = (raw_obs[i] - OBS_MEAN[i]) / OBS_STD[i];
     }
 }
 
@@ -377,8 +377,10 @@ int main()
 
             step_counter++;
 
-            // Optional: Print to verify the loop is actually surviving!
-            // printf("Step: %d | Pitch (Gravity Y): %.2f\n", step_counter, current_obs[241]);
+            printf("Step: %d | Action 0: %.2f\n", step_counter, target_actions[0]);
+
+            // // Optional: Print to verify the loop is actually surviving!
+            printf("Step: %d | Pitch (Gravity Y): %.2f\n", step_counter, current_obs[241]);
         }
 
         // When the math is done, the CPU loops here instantly until the next 20ms tick
