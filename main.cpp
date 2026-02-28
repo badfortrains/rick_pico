@@ -61,8 +61,8 @@ const float SERVO_DIRS[ACTION_DIM] = {
 
 // 90 degrees corresponds perfectly to 1500us based on your script
 float SERVO_CENTERS[ACTION_DIM] = {
-    1500.0f, 1500.0f, 1500.0f,
-    1500.0f, 1500.0f, 1500.0f};
+    1500.0f, 1500.0f, 1460.0f,
+    1500.0f, 1500.0f, 1440.0f};
 
 // Since center is 1500us, and max is 2500us, the max swing is 1000us.
 // A network output of 1.0 will add 1000us. An output of -1.0 will subtract 1000us.
@@ -301,7 +301,7 @@ void update_servos(const float *actions)
 
         // Safety clamping based directly on your MIN_DUTY and MAX_DUTY script limits!
         // Prevents the neural network from commanding <500us or >2500us and destroying the gears.
-        pulse_width_us = std::max(500.0f, std::min(2500.0f, pulse_width_us));
+        pulse_width_us = std::max(800.0f, std::min(2200.0f, pulse_width_us));
 
         uint slice_num = pwm_gpio_to_slice_num(SERVO_PINS[i]);
         pwm_set_chan_level(slice_num, pwm_gpio_to_channel(SERVO_PINS[i]), (uint16_t)pulse_width_us);
