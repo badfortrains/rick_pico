@@ -398,3 +398,68 @@ int main()
     }
     return 0;
 }
+
+// calibration
+// int main()
+// {
+//     stdio_init_all();
+
+//     // Give USB serial a moment to connect
+//     sleep_ms(2000);
+
+//     init_servos();
+
+//     // Create an array of pure 0.0f actions.
+//     // When passed to update_servos, this forces them to sit exactly at SERVO_CENTERS.
+//     float zero_actions[ACTION_DIM] = {0.0f};
+//     update_servos(zero_actions);
+
+//     printf("\n====================================\n");
+//     printf("--- LIVE SERVO CALIBRATION MODE ---\n");
+//     printf("====================================\n");
+//     printf("Controls:\n");
+//     printf("  [0] to [5] : Select a Servo to tune\n");
+//     printf("  [W] / [S]  : Increase/Decrease center by 5us\n");
+//     printf("  [P]        : Print the final array to copy/paste\n\n");
+
+//     int active_servo = 0;
+//     printf("Currently tuning Servo %d. Press W or S to adjust.\n", active_servo);
+
+//     while (true)
+//     {
+//         // Read keyboard input without freezing the microcontroller
+//         int c = getchar_timeout_us(10000);
+
+//         if (c != PICO_ERROR_TIMEOUT)
+//         {
+//             if (c >= '0' && c <= '5')
+//             {
+//                 active_servo = c - '0';
+//                 printf("\n-> Selected Servo %d\n", active_servo);
+//             }
+//             else if (c == 'w' || c == 'W')
+//             {
+//                 SERVO_CENTERS[active_servo] += 5.0f;
+//                 update_servos(zero_actions); // Apply immediately
+//                 printf("Servo %d Center: %.1f us\n", active_servo, SERVO_CENTERS[active_servo]);
+//             }
+//             else if (c == 's' || c == 'S')
+//             {
+//                 SERVO_CENTERS[active_servo] -= 5.0f;
+//                 update_servos(zero_actions); // Apply immediately
+//                 printf("Servo %d Center: %.1f us\n", active_servo, SERVO_CENTERS[active_servo]);
+//             }
+//             else if (c == 'p' || c == 'P')
+//             {
+//                 printf("\n--- CALIBRATION COMPLETE ---\n");
+//                 printf("Copy and paste this array into the top of your main.cpp:\n\n");
+//                 printf("float SERVO_CENTERS[ACTION_DIM] = {\n");
+//                 printf("    %.1ff, %.1ff, %.1ff, \n", SERVO_CENTERS[0], SERVO_CENTERS[1], SERVO_CENTERS[2]);
+//                 printf("    %.1ff, %.1ff, %.1ff\n", SERVO_CENTERS[3], SERVO_CENTERS[4], SERVO_CENTERS[5]);
+//                 printf("};\n\n");
+//             }
+//         }
+//         tight_loop_contents();
+//     }
+//     return 0;
+// }
