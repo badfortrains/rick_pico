@@ -1,3 +1,5 @@
 build
-!.vscode/*
+.vscode/*
 .DS_Store
+.fake
+rick_v2_pico.code-workspace
