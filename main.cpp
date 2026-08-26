@@ -3,12 +3,17 @@
 #include <cstdint>
 #include <stdio.h>
 
+#include "btstack.h"
 #include "hardware/pwm.h"
 #include "hardware/spi.h"
 #include "hardware/timer.h"
+#include "pico/btstack_cyw43.h"
+#include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
+#include "pico/util/queue.h"
 
 #include "policy_weights.h"
+#include "rick_control.h"
 
 // The generated header is the source of truth for the policy interface.
 #define OBS_DIM POLICY_OBS_DIM
@@ -21,6 +26,7 @@ constexpr int GYRO_OFFSET = GRAVITY_OFFSET + 3;
 constexpr int CLOCK_OFFSET = GYRO_OFFSET + 3;
 constexpr int TARGET_VELOCITY_OFFSET = CLOCK_OFFSET + 2;
 constexpr float PI_F = 3.14159265358979323846f;
+constexpr float RESET_ACTION_20_PERCENT = 0.20f;
 
 static_assert(ACTION_DIM == 8, "Rick v2 firmware expects eight servos");
 static_assert(
@@ -87,6 +93,40 @@ constexpr float MADGWICK_BETA = 0.1f;
 volatile bool run_control_step = false;
 uint32_t step_counter = 0;
 float gait_phase = 0.0f;
+
+enum class ControlCommand : uint8_t {
+    RESET_DEFAULT = 0,
+    RESET_20_PERCENT = 1,
+    START = 2,
+    STOP = 3,
+};
+
+constexpr uint8_t CONTROL_STATE_DEFAULT = 0;
+constexpr uint8_t CONTROL_STATE_20_PERCENT = 1;
+constexpr uint8_t CONTROL_STATE_RUNNING = 2;
+constexpr uint8_t CONTROL_STATE_STOPPED = 3;
+
+queue_t control_command_queue;
+volatile uint8_t control_state = CONTROL_STATE_DEFAULT;
+volatile bool stop_requested = false;
+bool robot_running = false;
+hci_con_handle_t bluetooth_connection_handle = HCI_CON_HANDLE_INVALID;
+
+static btstack_packet_callback_registration_t hci_event_callback_registration;
+static btstack_packet_callback_registration_t sm_event_callback_registration;
+
+// 7e57a001-4c91-4d8e-8f2a-7dca6d5a1000, least-significant byte first.
+const uint8_t BLUETOOTH_ADVERTISEMENT_DATA[] = {
+    2, BLUETOOTH_DATA_TYPE_FLAGS, 0x06,
+    8, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
+    'R', 'i', 'c', 'k', 'B', 'o', 't',
+    17, BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS,
+    0x00, 0x10, 0x5a, 0x6d, 0xca, 0x7d, 0x2a, 0x8f,
+    0x8e, 0x4d, 0x91, 0x4c, 0x01, 0xa0, 0x57, 0x7e,
+};
+static_assert(
+    sizeof(BLUETOOTH_ADVERTISEMENT_DATA) <= 31,
+    "Legacy BLE advertising data cannot exceed 31 bytes");
 
 inline float swish(float x) {
     // Algebraically identical to x * sigmoid(x), without exp overflow.
@@ -320,13 +360,87 @@ void update_servos(const float *actions) {
     }
 }
 
-void initialize_observation() {
+void reset_policy_state(float previous_action) {
+    q0 = 1.0f;
+    q1 = 0.0f;
+    q2 = 0.0f;
+    q3 = 0.0f;
+    gait_phase = 0.0f;
+    step_counter = 0;
+    run_control_step = false;
+
     for (float &value : current_obs) {
         value = 0.0f;
+    }
+    for (int index = 0; index < HISTORY_DIM; ++index) {
+        current_obs[index] = previous_action;
     }
     current_obs[CLOCK_OFFSET] = 0.0f;
     current_obs[CLOCK_OFFSET + 1] = 1.0f;
     current_obs[TARGET_VELOCITY_OFFSET] = POLICY_TARGET_VELOCITY;
+}
+
+void reset_servos(float action) {
+    robot_running = false;
+    for (float &target_action : target_actions) {
+        target_action = action;
+    }
+    reset_policy_state(action);
+    update_servos(target_actions);
+}
+
+void apply_control_command(ControlCommand command) {
+    switch (command) {
+        case ControlCommand::RESET_DEFAULT:
+            reset_servos(0.0f);
+            control_state = CONTROL_STATE_DEFAULT;
+            printf("Bluetooth command: reset to calibrated default pose.\n");
+            break;
+
+        case ControlCommand::RESET_20_PERCENT:
+            reset_servos(RESET_ACTION_20_PERCENT);
+            control_state = CONTROL_STATE_20_PERCENT;
+            printf("Bluetooth command: reset every joint to +20%% action.\n");
+            break;
+
+        case ControlCommand::START:
+            // Preserve the held pose in command history while resetting the IMU
+            // estimate and gait clock for a clean policy start.
+            reset_policy_state(target_actions[0]);
+            for (int history_index = 0; history_index < HISTORY_LEN; ++history_index) {
+                for (int action_index = 0; action_index < ACTION_DIM; ++action_index) {
+                    current_obs[history_index * ACTION_DIM + action_index] =
+                        target_actions[action_index];
+                }
+            }
+            robot_running = true;
+            control_state = CONTROL_STATE_RUNNING;
+            printf("Bluetooth command: start policy.\n");
+            break;
+
+        case ControlCommand::STOP:
+            robot_running = false;
+            run_control_step = false;
+            control_state = CONTROL_STATE_STOPPED;
+            printf("Bluetooth command: stop policy and hold current pose.\n");
+            break;
+    }
+}
+
+void process_control_commands() {
+    if (stop_requested) {
+        stop_requested = false;
+        uint8_t discarded_command;
+        while (queue_try_remove(&control_command_queue, &discarded_command)) {
+        }
+        apply_control_command(ControlCommand::STOP);
+        return;
+    }
+
+    uint8_t command_value;
+    while (queue_try_remove(&control_command_queue, &command_value)) {
+        apply_control_command(static_cast<ControlCommand>(command_value));
+    }
 }
 
 void update_imu_and_clock_observation(float gx, float gy, float gz) {
@@ -365,6 +479,166 @@ bool control_loop_callback(struct repeating_timer *) {
     return true;
 }
 
+uint16_t bluetooth_read_callback(
+    hci_con_handle_t connection_handle,
+    uint16_t attribute_handle,
+    uint16_t offset,
+    uint8_t *buffer,
+    uint16_t buffer_size) {
+    UNUSED(connection_handle);
+
+    if (attribute_handle !=
+        ATT_CHARACTERISTIC_7E57A002_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        return 0;
+    }
+
+    const uint8_t state = control_state;
+    return att_read_callback_handle_blob(
+        &state, sizeof(state), offset, buffer, buffer_size);
+}
+
+int bluetooth_write_callback(
+    hci_con_handle_t connection_handle,
+    uint16_t attribute_handle,
+    uint16_t transaction_mode,
+    uint16_t offset,
+    uint8_t *buffer,
+    uint16_t buffer_size) {
+    UNUSED(connection_handle);
+
+    if (attribute_handle !=
+        ATT_CHARACTERISTIC_7E57A002_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        return 0;
+    }
+    if (transaction_mode != ATT_TRANSACTION_MODE_NONE) {
+        return ATT_ERROR_REQUEST_NOT_SUPPORTED;
+    }
+    if (offset != 0) {
+        return ATT_ERROR_INVALID_OFFSET;
+    }
+    if (buffer_size != 1) {
+        return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+    }
+    if (buffer[0] > static_cast<uint8_t>(ControlCommand::STOP)) {
+        return ATT_ERROR_REQUEST_NOT_SUPPORTED;
+    }
+
+    if (buffer[0] == static_cast<uint8_t>(ControlCommand::STOP)) {
+        // This flag is observed before the command queue so Stop cannot be
+        // delayed behind other commands.
+        stop_requested = true;
+        return 0;
+    }
+    if (!queue_try_add(&control_command_queue, buffer)) {
+        return ATT_ERROR_INSUFFICIENT_RESOURCES;
+    }
+    return 0;
+}
+
+void start_bluetooth_advertising() {
+    constexpr uint16_t ADVERTISEMENT_INTERVAL = 0x00a0;  // 100 ms.
+    bd_addr_t null_address = {0};
+    gap_advertisements_set_params(
+        ADVERTISEMENT_INTERVAL,
+        ADVERTISEMENT_INTERVAL,
+        0,
+        0,
+        null_address,
+        0x07,
+        0x00);
+    gap_advertisements_set_data(
+        sizeof(BLUETOOTH_ADVERTISEMENT_DATA),
+        const_cast<uint8_t *>(BLUETOOTH_ADVERTISEMENT_DATA));
+    gap_advertisements_enable(1);
+}
+
+void bluetooth_packet_handler(
+    uint8_t packet_type,
+    uint16_t channel,
+    uint8_t *packet,
+    uint16_t size) {
+    UNUSED(channel);
+    UNUSED(size);
+
+    if (packet_type != HCI_EVENT_PACKET) {
+        return;
+    }
+
+    switch (hci_event_packet_get_type(packet)) {
+        case BTSTACK_EVENT_STATE:
+            if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+                bd_addr_t local_address;
+                gap_local_bd_addr(local_address);
+                printf(
+                    "Bluetooth ready as RickBot (%s). Waiting for Android.\n",
+                    bd_addr_to_str(local_address));
+                start_bluetooth_advertising();
+            }
+            break;
+
+        case HCI_EVENT_META_GAP:
+            if (hci_event_gap_meta_get_subevent_code(packet) ==
+                GAP_SUBEVENT_LE_CONNECTION_COMPLETE) {
+                bluetooth_connection_handle =
+                    gap_subevent_le_connection_complete_get_connection_handle(packet);
+                printf("Bluetooth connected; requesting encrypted pairing.\n");
+                sm_request_pairing(bluetooth_connection_handle);
+            }
+            break;
+
+        case HCI_EVENT_DISCONNECTION_COMPLETE:
+            if (hci_event_disconnection_complete_get_connection_handle(packet) ==
+                bluetooth_connection_handle) {
+                bluetooth_connection_handle = HCI_CON_HANDLE_INVALID;
+                stop_requested = true;
+                printf("Bluetooth disconnected; stopping policy.\n");
+                gap_advertisements_enable(1);
+            }
+            break;
+
+        case SM_EVENT_JUST_WORKS_REQUEST:
+            sm_just_works_confirm(
+                sm_event_just_works_request_get_handle(packet));
+            break;
+
+        case SM_EVENT_PAIRING_COMPLETE:
+            if (sm_event_pairing_complete_get_status(packet) == ERROR_CODE_SUCCESS) {
+                printf("Bluetooth pairing complete.\n");
+            } else {
+                stop_requested = true;
+                printf(
+                    "Bluetooth pairing failed (status 0x%02x).\n",
+                    sm_event_pairing_complete_get_status(packet));
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+bool init_bluetooth() {
+    if (cyw43_arch_init() != 0) {
+        printf("Failed to initialize the Pico 2 W wireless chip.\n");
+        return false;
+    }
+
+    l2cap_init();
+    sm_init();
+    sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    sm_set_authentication_requirements(
+        SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+    att_server_init(profile_data, bluetooth_read_callback, bluetooth_write_callback);
+
+    hci_event_callback_registration.callback = bluetooth_packet_handler;
+    hci_add_event_handler(&hci_event_callback_registration);
+    sm_event_callback_registration.callback = bluetooth_packet_handler;
+    sm_add_event_handler(&sm_event_callback_registration);
+
+    hci_power_control(HCI_POWER_ON);
+    return true;
+}
+
 int main() {
     stdio_init_all();
     printf(
@@ -375,19 +649,14 @@ int main() {
 
     init_imu();
     init_servos();
-    initialize_observation();
+    queue_init(&control_command_queue, sizeof(uint8_t), 8);
+    reset_servos(0.0f);
+    control_state = CONTROL_STATE_DEFAULT;
 
-    for (float &action : target_actions) {
-        action = 0.0f;
+    printf("\nServos at calibrated centers; policy is stopped.\n");
+    if (!init_bluetooth()) {
+        return 1;
     }
-    update_servos(target_actions);
-
-    printf("\nServos at calibrated centers. Support the robot and verify all joints.\n");
-    for (int seconds = 10; seconds > 0; --seconds) {
-        printf("Starting in %d...\n", seconds);
-        sleep_ms(1000);
-    }
-    printf("GO!\n\n");
 
     struct repeating_timer timer;
     const int64_t interval_us =
@@ -402,21 +671,25 @@ int main() {
     float az;
 
     while (true) {
+        process_control_commands();
+
         if (run_control_step) {
             run_control_step = false;
 
-            read_imu(&gx, &gy, &gz, &ax, &ay, &az);
-            madgwick_update_6dof(gx, gy, gz, ax, ay, az, POLICY_CONTROL_DT);
-            update_imu_and_clock_observation(gx, gy, gz);
+            if (robot_running) {
+                read_imu(&gx, &gy, &gz, &ax, &ay, &az);
+                madgwick_update_6dof(gx, gy, gz, ax, ay, az, POLICY_CONTROL_DT);
+                update_imu_and_clock_observation(gx, gy, gz);
 
-            infer_action(current_obs, target_actions);
-            update_servos(target_actions);
-            append_command_history(target_actions);
-            advance_gait_phase();
-            ++step_counter;
+                infer_action(current_obs, target_actions);
+                update_servos(target_actions);
+                append_command_history(target_actions);
+                advance_gait_phase();
+                ++step_counter;
 
-            // Uncomment for a one-line heartbeat once per second.
-            // if (step_counter % 50 == 0) printf("Policy step %u\n", step_counter);
+                // Uncomment for a one-line heartbeat once per second.
+                // if (step_counter % 50 == 0) printf("Policy step %u\n", step_counter);
+            }
         }
         tight_loop_contents();
     }

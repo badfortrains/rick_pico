@@ -12,7 +12,7 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
-set(PICO_BOARD pico2 CACHE STRING "Board type")
+set(PICO_BOARD pico2_w CACHE STRING "Board type")
 
 cmake_minimum_required(VERSION 3.13)
 include(pico_sdk_import.cmake)
@@ -39,9 +39,22 @@ pico_enable_stdio_uart(rick_v2_pico 0)
 # Link the required hardware libraries
 target_link_libraries(rick_v2_pico 
     pico_stdlib
+    pico_btstack_ble
+    pico_btstack_cyw43
+    pico_cyw43_arch_none
     hardware_spi
     hardware_timer
     hardware_pwm
+)
+
+target_include_directories(rick_v2_pico PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+pico_btstack_make_gatt_header(
+    rick_v2_pico
+    PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/rick_control.gatt"
 )
 
 # Create the .uf2 file for dragging and dropping onto the Pico

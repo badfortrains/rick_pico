@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#10100f">
+  <title>Rick Bluetooth Control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --paper: #f2eadb;
+      --ink: #171715;
+      --muted: #a6a298;
+      --panel: #1b1b19;
+      --line: #34332f;
+      --orange: #ff7a45;
+      --green: #55d187;
+      --red: #ff5e5e;
+      --blue: #79a7ff;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { min-height: 100%; background: #10100f; }
+
+    body {
+      min-height: 100vh;
+      min-height: 100dvh;
+      margin: 0;
+      padding: max(22px, env(safe-area-inset-top)) 18px
+        max(24px, env(safe-area-inset-bottom));
+      background:
+        radial-gradient(circle at 84% 4%, rgba(255, 122, 69, 0.16), transparent 30%),
+        linear-gradient(180deg, #171715 0%, #10100f 100%);
+      color: var(--paper);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    main {
+      width: min(100%, 520px);
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 22px;
+    }
+
+    .eyebrow {
+      margin: 2px 0 7px;
+      color: var(--orange);
+      font: 700 0.72rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.17em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2.2rem, 11vw, 4rem);
+      font-weight: 760;
+      line-height: 0.9;
+      letter-spacing: -0.065em;
+    }
+
+    .mark {
+      display: grid;
+      flex: 0 0 54px;
+      width: 54px;
+      height: 54px;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      color: var(--orange);
+      font: 800 1rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .card {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: rgba(27, 27, 25, 0.9);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.32);
+    }
+
+    .connection {
+      padding: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .connection-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .status-copy { min-width: 0; }
+
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 1rem;
+      font-weight: 720;
+    }
+
+    .status-detail {
+      overflow: hidden;
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      flex: 0 0 9px;
+      border-radius: 50%;
+      background: #6d6a63;
+      box-shadow: 0 0 0 4px rgba(109, 106, 99, 0.12);
+    }
+
+    .dot.connected {
+      background: var(--green);
+      box-shadow: 0 0 0 4px rgba(85, 209, 135, 0.13);
+    }
+
+    .dot.working {
+      background: var(--orange);
+      box-shadow: 0 0 0 4px rgba(255, 122, 69, 0.13);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+
+    @keyframes pulse { 50% { opacity: 0.42; } }
+
+    button {
+      border: 0;
+      color: inherit;
+      font: inherit;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    button:focus-visible {
+      outline: 3px solid var(--blue);
+      outline-offset: 3px;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.38;
+    }
+
+    .connect-button {
+      min-height: 44px;
+      padding: 0 16px;
+      flex: 0 0 auto;
+      border: 1px solid #535049;
+      border-radius: 999px;
+      background: var(--paper);
+      color: var(--ink);
+      font-size: 0.86rem;
+      font-weight: 780;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: var(--line);
+    }
+
+    .command {
+      min-height: 152px;
+      padding: 19px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 22px;
+      background: var(--panel);
+      text-align: left;
+      transition: background 120ms ease, transform 80ms ease;
+    }
+
+    .command:active:not(:disabled) {
+      transform: scale(0.985);
+      background: #24231f;
+    }
+
+    .command-number {
+      color: #77736a;
+      font: 650 0.72rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .command-label {
+      display: block;
+      max-width: 12ch;
+      font-size: 1.04rem;
+      font-weight: 720;
+      line-height: 1.14;
+      letter-spacing: -0.025em;
+    }
+
+    .command small {
+      display: block;
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 500;
+      line-height: 1.35;
+    }
+
+    .command.start .command-number,
+    .command.start .command-label { color: var(--green); }
+
+    .command.stop .command-number,
+    .command.stop .command-label { color: var(--red); }
+
+    .message {
+      min-height: 43px;
+      margin: 0;
+      padding: 13px 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.35;
+    }
+
+    .message.error { color: #ff9292; }
+
+    .safety {
+      margin: 17px 2px 0;
+      display: flex;
+      gap: 10px;
+      color: #8f8b82;
+      font-size: 0.76rem;
+      line-height: 1.5;
+    }
+
+    .safety::before {
+      content: "!";
+      display: grid;
+      width: 19px;
+      height: 19px;
+      flex: 0 0 19px;
+      place-items: center;
+      border: 1px solid #57534c;
+      border-radius: 50%;
+      color: var(--orange);
+      font: 750 0.7rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    @media (max-width: 360px) {
+      .controls { grid-template-columns: 1fr; }
+      .command { min-height: 116px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">Pico 2 W · BLE</p>
+        <h1>Rick<br>control</h1>
+      </div>
+      <div class="mark" aria-hidden="true">R2</div>
+    </header>
+
+    <section class="card" aria-label="Robot controls">
+      <div class="connection">
+        <div class="connection-row">
+          <div class="status-copy">
+            <div class="status-line">
+              <span class="dot" id="statusDot" aria-hidden="true"></span>
+              <span id="statusText">Not connected</span>
+            </div>
+            <div class="status-detail" id="statusDetail">Pair with RickBot to enable controls</div>
+          </div>
+          <button class="connect-button" id="connectButton" type="button">Pair &amp; connect</button>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button class="command" data-command="0" type="button" disabled>
+          <span class="command-number">01</span>
+          <span>
+            <span class="command-label">Reset to default pos</span>
+            <small>Calibrated servo centers</small>
+          </span>
+        </button>
+
+        <button class="command" data-command="1" type="button" disabled>
+          <span class="command-number">02</span>
+          <span>
+            <span class="command-label">Reset to 20% joint angle</span>
+            <small>Normalized +0.20 on all joints</small>
+          </span>
+        </button>
+
+        <button class="command start" data-command="2" type="button" disabled>
+          <span class="command-number">03</span>
+          <span>
+            <span class="command-label">Start</span>
+            <small>Run PPO control at 50 Hz</small>
+          </span>
+        </button>
+
+        <button class="command stop" data-command="3" type="button" disabled>
+          <span class="command-number">04</span>
+          <span>
+            <span class="command-label">Stop</span>
+            <small>Stop policy and hold pose</small>
+          </span>
+        </button>
+      </div>
+
+      <p class="message" id="message" role="status" aria-live="polite">Controls are locked until Bluetooth is connected.</p>
+    </section>
+
+    <p class="safety">Support the robot off the ground during first use. Keep people and cables clear before pressing Start. A Bluetooth disconnect stops the policy and holds the last pose.</p>
+  </main>
+
+  <script>
+    "use strict";
+
+    const SERVICE_UUID = "7e57a001-4c91-4d8e-8f2a-7dca6d5a1000";
+    const CONTROL_UUID = "7e57a002-4c91-4d8e-8f2a-7dca6d5a1000";
+
+    const stateLabels = [
+      ["Default pose", "Policy stopped · calibrated centers"],
+      ["20% pose", "Policy stopped · all joints at +0.20"],
+      ["Running", "PPO policy active at 50 Hz"],
+      ["Stopped", "Policy stopped · holding current pose"]
+    ];
+
+    const commandMessages = [
+      "Reset to calibrated default pose.",
+      "Reset every joint to normalized +0.20.",
+      "PPO policy started.",
+      "PPO policy stopped; holding the current pose."
+    ];
+
+    const connectButton = document.getElementById("connectButton");
+    const statusDot = document.getElementById("statusDot");
+    const statusText = document.getElementById("statusText");
+    const statusDetail = document.getElementById("statusDetail");
+    const message = document.getElementById("message");
+    const commandButtons = [...document.querySelectorAll("[data-command]")];
+    const bluetoothSupported = "bluetooth" in navigator;
+
+    let device = null;
+    let controlCharacteristic = null;
+    let busy = false;
+
+    function isConnected() {
+      return Boolean(device?.gatt?.connected && controlCharacteristic);
+    }
+
+    function setMessage(text, isError = false) {
+      message.textContent = text;
+      message.classList.toggle("error", isError);
+    }
+
+    function updateButtons() {
+      const locked = !isConnected() || busy;
+      commandButtons.forEach((button) => { button.disabled = locked; });
+      connectButton.disabled = busy || !bluetoothSupported;
+      connectButton.textContent = isConnected() ? "Disconnect" : "Pair & connect";
+    }
+
+    function showConnection(status, detail, mode = "") {
+      statusText.textContent = status;
+      statusDetail.textContent = detail;
+      statusDot.className = `dot ${mode}`.trim();
+    }
+
+    function showRobotState(state) {
+      const label = stateLabels[state] || ["Connected", "Robot state unavailable"];
+      showConnection(label[0], label[1], "connected");
+    }
+
+    async function readRobotState() {
+      const value = await controlCharacteristic.readValue();
+      const state = value.getUint8(0);
+      showRobotState(state);
+      return state;
+    }
+
+    async function connect() {
+      if (!bluetoothSupported) {
+        setMessage(
+          window.isSecureContext
+            ? "Web Bluetooth is unavailable in this browser. Open this page in Chrome on Android."
+            : "Web Bluetooth requires a secure page. Open this file directly or serve it over HTTPS.",
+          true
+        );
+        return;
+      }
+
+      busy = true;
+      showConnection("Pairing…", "Choose RickBot in the Bluetooth list", "working");
+      setMessage("Android may ask you to approve a secure Bluetooth pairing.");
+      updateButtons();
+
+      try {
+        device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [SERVICE_UUID] }]
+        });
+        device.addEventListener("gattserverdisconnected", handleDisconnect);
+
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        controlCharacteristic = await service.getCharacteristic(CONTROL_UUID);
+
+        showConnection("Connected", device.name || "RickBot", "connected");
+        setMessage("Secure Bluetooth connected. Robot controls are ready.");
+
+        try {
+          await readRobotState();
+        } catch (error) {
+          // A first-time bond can finish just after GATT discovery. Commands
+          // remain available and will request encryption again if needed.
+          showConnection("Connected", device.name || "RickBot", "connected");
+        }
+      } catch (error) {
+        controlCharacteristic = null;
+        if (device?.gatt?.connected) device.gatt.disconnect();
+
+        if (error.name === "NotFoundError") {
+          showConnection("Not connected", "Pairing was cancelled", "");
+          setMessage("No device selected. Tap Pair & connect to try again.");
+        } else {
+          showConnection("Connection failed", "Could not reach RickBot", "");
+          setMessage(`${error.message || error.name}. Power-cycle the Pico and try again.`, true);
+        }
+      } finally {
+        busy = false;
+        updateButtons();
+      }
+    }
+
+    function handleDisconnect() {
+      controlCharacteristic = null;
+      busy = false;
+      showConnection("Disconnected", "Robot policy stopped automatically", "");
+      setMessage("Connection lost. The firmware is holding the robot's last pose.", true);
+      updateButtons();
+    }
+
+    async function sendCommand(command) {
+      if (!isConnected() || busy) return;
+
+      if (command === 2 && !window.confirm(
+        "Start PPO motion? Make sure the robot is supported and the area is clear."
+      )) return;
+
+      busy = true;
+      showConnection("Sending…", commandMessages[command], "working");
+      setMessage("Sending encrypted command to RickBot…");
+      updateButtons();
+
+      try {
+        const payload = Uint8Array.of(command);
+        if (typeof controlCharacteristic.writeValueWithResponse === "function") {
+          await controlCharacteristic.writeValueWithResponse(payload);
+        } else {
+          await controlCharacteristic.writeValue(payload);
+        }
+
+        // Firmware receives Bluetooth events in a background context and then
+        // applies commands safely in the main control loop.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        try {
+          await readRobotState();
+        } catch (error) {
+          showRobotState(command);
+        }
+        setMessage(commandMessages[command]);
+      } catch (error) {
+        setMessage(`${error.message || error.name}. Reconnect and try again.`, true);
+        if (!device?.gatt?.connected) handleDisconnect();
+      } finally {
+        busy = false;
+        updateButtons();
+      }
+    }
+
+    connectButton.addEventListener("click", () => {
+      if (isConnected()) {
+        device.gatt.disconnect();
+      } else {
+        connect();
+      }
+    });
+
+    commandButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        sendCommand(Number(button.dataset.command));
+      });
+    });
+
+    if (!bluetoothSupported) {
+      setMessage(
+        window.isSecureContext
+          ? "Open this page in Chrome on an Android device with Bluetooth enabled."
+          : "This browser blocks Bluetooth here. Open the file directly or use an HTTPS address.",
+        true
+      );
+    }
+
+    updateButtons();
+  </script>
+</body>
+</html>

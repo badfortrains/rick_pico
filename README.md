@@ -1,4 +1,4 @@
-# RickJoystickFlatTerrain on Raspberry Pi Pico 2
+# RickJoystickFlatTerrain on Raspberry Pi Pico 2 W
 
 This firmware runs the deterministic policy from the Brax PPO checkpoint. The
 generated `policy_weights.h` contains both the network parameters and the
@@ -58,8 +58,38 @@ with `action_scale = 0.35` radians, so the firmware converts a policy action of
 external power supply with a common ground; do not power eight servos from the
 Pico.
 
+## Bluetooth control
+
+The Pico advertises a Bluetooth Low Energy device named **RickBot**. On boot,
+the firmware moves to the calibrated default pose and remains stopped until it
+receives a Start command. Pairing uses encrypted LE Secure Connections with
+Just Works confirmation and stores the Android bond in flash.
+
+Copy `bluetooth.html` to the Android device and open it in Chrome, then:
+
+1. Tap **Pair & connect** and choose **RickBot**.
+2. Approve the Android pairing request if one appears.
+3. Use one of the four controls:
+   - **Reset to default pos** stops the policy and moves all servos to their
+     calibrated centers.
+   - **Reset to 20% joint angle** stops the policy and sends normalized policy
+     action `+0.20` to every servo (20% of the trained action range around each
+     calibrated center, with `SERVO_DIRS` applied).
+   - **Start** resets the gait clock and IMU orientation estimate, then runs the
+     PPO policy at 50 Hz.
+   - **Stop** stops policy inference and holds the last commanded servo pose.
+
+Disconnecting Bluetooth also stops the policy and holds the last pose. Always
+test with the robot supported off the ground first.
+
+Web Bluetooth is supported by Chrome on Android and is restricted to secure
+contexts. The controller is a completely self-contained file; if Chrome does
+not expose Bluetooth when it is opened from local storage, serve the unchanged
+file from an HTTPS static host.
+
 ## Build
 
-The project targets `pico2` in `CMakeLists.txt`. Build and flash it through the
-Raspberry Pi Pico VS Code extension as before. On boot, the firmware centers
-all eight servos for ten seconds before starting the 50 Hz controller.
+The project now targets `pico2_w` in `CMakeLists.txt` and uses the Pico SDK
+BTstack/CYW43 libraries. Build and flash it through the Raspberry Pi Pico VS
+Code extension as before. Ensure the SDK's `btstack` and `cyw43-driver`
+submodules are installed; the Pico extension normally manages these.
