@@ -304,8 +304,8 @@
         <button class="command" data-command="1" type="button" disabled>
           <span class="command-number">02</span>
           <span>
-            <span class="command-label">Reset to 20% joint angle</span>
-            <small>Normalized +0.20 on all joints</small>
+            <span class="command-label">Reset to full action</span>
+            <small>Normalized +1.0 on all joints</small>
           </span>
         </button>
 
@@ -340,14 +340,14 @@
 
     const stateLabels = [
       ["Default pose", "Policy stopped · calibrated centers"],
-      ["20% pose", "Policy stopped · all joints at +0.20"],
+      ["Full action pose", "Policy stopped · all joints at +1.0"],
       ["Running", "PPO policy active at 50 Hz"],
       ["Stopped", "Policy stopped · holding current pose"]
     ];
 
     const commandMessages = [
       "Reset to calibrated default pose.",
-      "Reset every joint to normalized +0.20.",
+      "Reset every joint to normalized +1.0.",
       "PPO policy started.",
       "PPO policy stopped; holding the current pose."
     ];

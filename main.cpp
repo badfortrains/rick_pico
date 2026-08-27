@@ -26,7 +26,7 @@ constexpr int GYRO_OFFSET = GRAVITY_OFFSET + 3;
 constexpr int CLOCK_OFFSET = GYRO_OFFSET + 3;
 constexpr int TARGET_VELOCITY_OFFSET = CLOCK_OFFSET + 2;
 constexpr float PI_F = 3.14159265358979323846f;
-constexpr float RESET_ACTION_20_PERCENT = 0.20f;
+constexpr float RESET_ACTION_FULL = 1.0f;
 
 static_assert(ACTION_DIM == 8, "Rick v2 firmware expects eight servos");
 static_assert(
@@ -96,13 +96,13 @@ float gait_phase = 0.0f;
 
 enum class ControlCommand : uint8_t {
     RESET_DEFAULT = 0,
-    RESET_20_PERCENT = 1,
+    RESET_FULL_ACTION = 1,
     START = 2,
     STOP = 3,
 };
 
 constexpr uint8_t CONTROL_STATE_DEFAULT = 0;
-constexpr uint8_t CONTROL_STATE_20_PERCENT = 1;
+constexpr uint8_t CONTROL_STATE_FULL_ACTION = 1;
 constexpr uint8_t CONTROL_STATE_RUNNING = 2;
 constexpr uint8_t CONTROL_STATE_STOPPED = 3;
 
@@ -397,10 +397,10 @@ void apply_control_command(ControlCommand command) {
             printf("Bluetooth command: reset to calibrated default pose.\n");
             break;
 
-        case ControlCommand::RESET_20_PERCENT:
-            reset_servos(RESET_ACTION_20_PERCENT);
-            control_state = CONTROL_STATE_20_PERCENT;
-            printf("Bluetooth command: reset every joint to +20%% action.\n");
+        case ControlCommand::RESET_FULL_ACTION:
+            reset_servos(RESET_ACTION_FULL);
+            control_state = CONTROL_STATE_FULL_ACTION;
+            printf("Bluetooth command: reset every joint to +1.0 action.\n");
             break;
 
         case ControlCommand::START:

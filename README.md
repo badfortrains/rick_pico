@@ -72,8 +72,8 @@ Copy `bluetooth.html` to the Android device and open it in Chrome, then:
 3. Use one of the four controls:
    - **Reset to default pos** stops the policy and moves all servos to their
      calibrated centers.
-   - **Reset to 20% joint angle** stops the policy and sends normalized policy
-     action `+0.20` to every servo (20% of the trained action range around each
+   - **Reset to full action** stops the policy and sends normalized policy
+     action `+1.0` to every servo (the full trained action range around each
      calibrated center, with `SERVO_DIRS` applied).
    - **Start** resets the gait clock and IMU orientation estimate, then runs the
      PPO policy at 50 Hz.
