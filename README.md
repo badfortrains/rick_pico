@@ -102,9 +102,16 @@ Disconnecting Bluetooth also stops the policy and holds the last pose. Always
 test and calibrate with the robot supported off the ground first.
 
 Web Bluetooth is supported by Chrome on Android and is restricted to secure
-contexts. The controller is a completely self-contained file; if Chrome does
-not expose Bluetooth when it is opened from local storage, serve the unchanged
-file from an HTTPS static host.
+contexts. The controller can still be opened directly for development, but its
+install and offline features require `bluetooth.html`, `manifest.webmanifest`,
+`service-worker.js`, and the `icons` directory to be served together from an
+HTTPS static host.
+
+The controller is also an installable Progressive Web App when served over
+HTTPS. Open it in Chrome on Android, then use the in-page **Install app** button
+when it appears, or choose **Add to Home screen** from Chrome's menu. The app
+shell is cached so the controller can open without an internet connection;
+Bluetooth still needs to be enabled on the phone.
 
 ## Build
 

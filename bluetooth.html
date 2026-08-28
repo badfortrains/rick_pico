@@ -4,6 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#10100f">
+  <meta name="description" content="Bluetooth controls and calibration tools for RickBot.">
+  <meta name="application-name" content="Rick Control">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Rick Control">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/rick-192.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/rick-180.png">
   <title>Rick Bluetooth Control</title>
   <style>
     :root {
@@ -51,6 +60,14 @@
       margin-bottom: 22px;
     }
 
+    .header-actions {
+      display: flex;
+      flex: 0 0 auto;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 9px;
+    }
+
     .eyebrow {
       margin: 2px 0 7px;
       color: var(--orange);
@@ -78,6 +95,20 @@
       color: var(--orange);
       font: 800 1rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
     }
+
+    .install-button {
+      min-height: 38px;
+      padding: 0 13px;
+      border: 1px solid rgba(255, 122, 69, 0.65);
+      border-radius: 999px;
+      background: rgba(255, 122, 69, 0.1);
+      color: var(--orange);
+      font-size: 0.75rem;
+      font-weight: 760;
+      white-space: nowrap;
+    }
+
+    [hidden] { display: none !important; }
 
     .card {
       overflow: hidden;
@@ -460,7 +491,10 @@
         <p class="eyebrow">Pico 2 W · BLE</p>
         <h1>Rick<br>control</h1>
       </div>
-      <div class="mark" aria-hidden="true">R2</div>
+      <div class="header-actions">
+        <div class="mark" aria-hidden="true">R2</div>
+        <button class="install-button" id="installButton" type="button" hidden>Install app</button>
+      </div>
     </header>
 
     <section class="card" aria-label="Robot controls">
@@ -617,6 +651,7 @@
     const finishCalibration = document.getElementById("finishCalibration");
     const copyCenters = document.getElementById("copyCenters");
     const centerCode = document.getElementById("centerCode");
+    const installButton = document.getElementById("installButton");
     const bluetoothSupported = "bluetooth" in navigator;
 
     let device = null;
@@ -632,6 +667,7 @@
     let servoCenters = Array(servoNames.length).fill(null);
     const verifiedAxes = new Set();
     const centeredServos = new Set();
+    let deferredInstallPrompt = null;
 
     function renderServoRows() {
       servoList.innerHTML = servoNames.map((name, index) => `
@@ -1055,6 +1091,33 @@
 
     finishCalibration.addEventListener("click", finishServoCalibration);
     copyCenters.addEventListener("click", copyServoCenters);
+
+    window.addEventListener("beforeinstallprompt", (event) => {
+      event.preventDefault();
+      deferredInstallPrompt = event;
+      installButton.hidden = false;
+    });
+
+    installButton.addEventListener("click", async () => {
+      if (!deferredInstallPrompt) return;
+      deferredInstallPrompt.prompt();
+      await deferredInstallPrompt.userChoice;
+      deferredInstallPrompt = null;
+      installButton.hidden = true;
+    });
+
+    window.addEventListener("appinstalled", () => {
+      deferredInstallPrompt = null;
+      installButton.hidden = true;
+    });
+
+    if ("serviceWorker" in navigator && window.isSecureContext) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./service-worker.js").catch((error) => {
+          console.error("Rick Control service worker registration failed", error);
+        });
+      });
+    }
 
     if (!bluetoothSupported) {
       setMessage(
