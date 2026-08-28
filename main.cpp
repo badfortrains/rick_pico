@@ -58,8 +58,8 @@ const float SERVO_DIRS[ACTION_DIM] = {
 
 // Existing lower-leg calibration values are retained at their shifted indices.
 float SERVO_CENTERS_US[ACTION_DIM] = {
-    1585.0f, 1555.0f, 1420.0f, 1500.0f,
-    1445.0f, 1500.0f, 1600.0f, 1570.0f,
+    1575.0f, 1555.0f, 1400.0f, 1470.0f,
+    1465.0f, 1500.0f, 1590.0f, 1570.0f,
 };
 
 // A conventional 500--2500 us servo spans approximately pi radians. The
@@ -735,8 +735,11 @@ void bluetooth_packet_handler(
                 GAP_SUBEVENT_LE_CONNECTION_COMPLETE) {
                 bluetooth_connection_handle =
                     gap_subevent_le_connection_complete_get_connection_handle(packet);
-                printf("Bluetooth connected; requesting encrypted pairing.\n");
-                sm_request_pairing(bluetooth_connection_handle);
+                // Android Web Bluetooth pairs transparently when an encrypted
+                // characteristic is first written. Starting pairing here can
+                // race Android's GATT discovery and leave its first read
+                // pending until the connection times out.
+                printf("Bluetooth connected; waiting for an encrypted command.\n");
             }
             break;
 

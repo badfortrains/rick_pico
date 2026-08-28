@@ -62,13 +62,15 @@ Pico.
 
 The Pico advertises a Bluetooth Low Energy device named **RickBot**. On boot,
 the firmware moves to the calibrated default pose and remains stopped until it
-receives a Start command. Pairing uses encrypted LE Secure Connections with
-Just Works confirmation and stores the Android bond in flash.
+receives a Start command. Robot-changing commands use encrypted LE Secure
+Connections with Just Works confirmation and store the Android bond in flash.
+State and telemetry reads do not require pairing, so Android can finish GATT
+discovery before it prompts for security on the first command.
 
 Copy `bluetooth.html` to the Android device and open it in Chrome, then:
 
 1. Tap **Pair & connect** and choose **RickBot**.
-2. Approve the Android pairing request if one appears.
+2. Tap a control and approve the Android pairing request if one appears.
 3. Use one of the four controls:
    - **Reset to default pos** stops the policy and moves all servos to their
      calibrated centers.

@@ -626,6 +626,7 @@
     let busy = false;
     let imuReadPending = false;
     let imuPollTimer = null;
+    let gattOperationQueue = Promise.resolve();
     let lastImuReadAt = 0;
     let accelerometer = [0, 0, 0];
     let servoCenters = Array(servoNames.length).fill(null);
@@ -710,15 +711,25 @@
       showConnection(label[0], label[1], "connected");
     }
 
+    function queueGattOperation(operation) {
+      // Android allows only one active GATT operation. Keep polling reads from
+      // overlapping a command write if the user taps between polling ticks.
+      const queued = gattOperationQueue.then(operation, operation);
+      gattOperationQueue = queued.catch(() => {});
+      return queued;
+    }
+
     async function readRobotState() {
-      const value = await controlCharacteristic.readValue();
+      const characteristic = controlCharacteristic;
+      const value = await queueGattOperation(() => characteristic.readValue());
       const state = value.getUint8(0);
       showRobotState(state);
       return state;
     }
 
     async function readServoCenters() {
-      const value = await servoCharacteristic.readValue();
+      const characteristic = servoCharacteristic;
+      const value = await queueGattOperation(() => characteristic.readValue());
       if (value.byteLength < servoNames.length * 2) {
         throw new Error("Servo calibration response was incomplete");
       }
@@ -731,7 +742,8 @@
       if (!imuCharacteristic || imuReadPending) return;
       imuReadPending = true;
       try {
-        const value = await imuCharacteristic.readValue();
+        const characteristic = imuCharacteristic;
+        const value = await queueGattOperation(() => characteristic.readValue());
         if (value.byteLength < 12) throw new Error("IMU response was incomplete");
 
         accelerometer = [0, 1, 2].map((index) => value.getInt16(index * 2, true) / 1000);
@@ -766,11 +778,12 @@
     }
 
     async function writeWithResponse(characteristic, payload) {
-      if (typeof characteristic.writeValueWithResponse === "function") {
-        await characteristic.writeValueWithResponse(payload);
-      } else {
-        await characteristic.writeValue(payload);
-      }
+      await queueGattOperation(() => {
+        if (typeof characteristic.writeValueWithResponse === "function") {
+          return characteristic.writeValueWithResponse(payload);
+        }
+        return characteristic.writeValue(payload);
+      });
     }
 
     async function connect() {
@@ -790,6 +803,7 @@
       updateButtons();
 
       try {
+        gattOperationQueue = Promise.resolve();
         device = await navigator.bluetooth.requestDevice({
           filters: [{ services: [SERVICE_UUID] }]
         });
@@ -801,8 +815,8 @@
         imuCharacteristic = await service.getCharacteristic(IMU_UUID);
         servoCharacteristic = await service.getCharacteristic(SERVO_UUID);
 
-        showConnection("Connected", device.name || "RickBot", "connected");
-        setMessage("Secure Bluetooth connected. Control and calibration are ready.");
+        showConnection("Initializing…", "Reading RickBot state", "working");
+        setMessage("Bluetooth connected. Preparing control and calibration…");
         centeredServos.clear();
         resetAxisChecks();
         centerCode.classList.add("hidden");
@@ -813,10 +827,12 @@
           await readRobotState();
           await readServoCenters();
           await readImuTelemetry();
+          setMessage("Bluetooth connected. Control and calibration are ready.");
         } catch (error) {
-          // A first-time bond can finish just after GATT discovery. Commands
-          // remain available and will request encryption again if needed.
+          // Initial reads are informational. Robot-changing writes remain
+          // available and request encrypted pairing on first use.
           showConnection("Connected", device.name || "RickBot", "connected");
+          setMessage("Connected. Live state was unavailable, but controls are ready.");
         }
       } catch (error) {
         controlCharacteristic = null;
@@ -840,6 +856,7 @@
 
     function handleDisconnect() {
       stopImuPolling();
+      gattOperationQueue = Promise.resolve();
       controlCharacteristic = null;
       imuCharacteristic = null;
       servoCharacteristic = null;
