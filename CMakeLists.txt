@@ -42,6 +42,8 @@ target_link_libraries(rick_v2_pico
     pico_btstack_ble
     pico_btstack_cyw43
     pico_cyw43_arch_none
+    pico_sha256
+    boot_uf2_headers
     hardware_spi
     hardware_timer
     hardware_pwm
@@ -57,5 +59,21 @@ pico_btstack_make_gatt_header(
     "${CMAKE_CURRENT_LIST_DIR}/rick_control.gatt"
 )
 
-# Create the .uf2 file for dragging and dropping onto the Pico
+# Embed the RP2350 A/B layout in the initial wired image. Each application
+# partition is 2040 KiB. The final 16 KiB remain unpartitioned so BTstack's
+# two-sector bond store and the RP2350-E10 reserved sector stay untouched.
+pico_embed_pt_in_binary(
+    rick_v2_pico
+    "${CMAKE_CURRENT_LIST_DIR}/ota_partition.json"
+)
+
+# Hash every image so the RP2350 boot ROM verifies it before launch. TBYB
+# keeps the previous partition bootable until the new firmware initializes
+# its hardware and Bluetooth stack and explicitly accepts the update.
+target_compile_definitions(rick_v2_pico PRIVATE
+    PICO_CRT0_IMAGE_TYPE_TBYB=1
+)
+pico_hash_binary(rick_v2_pico)
+
+# Create the .uf2 file for the initial wired flash and later BLE updates.
 pico_add_extra_outputs(rick_v2_pico)

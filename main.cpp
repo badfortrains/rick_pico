@@ -1,14 +1,21 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <stdio.h>
 
+#include "pico.h"
+#include "boot/picobin.h"
+#include "boot/picoboot.h"
+#include "boot/uf2.h"
 #include "btstack.h"
 #include "hardware/pwm.h"
 #include "hardware/spi.h"
 #include "hardware/timer.h"
 #include "pico/btstack_cyw43.h"
+#include "pico/bootrom.h"
 #include "pico/cyw43_arch.h"
+#include "pico/sha256.h"
 #include "pico/stdlib.h"
 #include "pico/util/queue.h"
 
@@ -122,6 +129,85 @@ volatile bool stop_requested = false;
 bool robot_running = false;
 bool servo_calibration_active = false;
 hci_con_handle_t bluetooth_connection_handle = HCI_CON_HANDLE_INVALID;
+
+// BLE OTA protocol. A complete UF2 stream is written to the inactive RP2350
+// A/B partition. The currently running partition is never erased.
+constexpr uint8_t OTA_PROTOCOL_VERSION = 1;
+constexpr uint8_t OTA_CONTROL_BEGIN = 1;
+constexpr uint8_t OTA_CONTROL_ABORT = 2;
+constexpr uint8_t OTA_CONTROL_COMMIT = 3;
+constexpr uint8_t OTA_CONTROL_DIGEST = 4;
+constexpr size_t OTA_SHA256_SIZE = SHA256_RESULT_BYTES;
+constexpr size_t OTA_BEGIN_PACKET_SIZE = 1 + 4 + 4;
+constexpr size_t OTA_MAX_CONTROL_PACKET_SIZE = 20;
+constexpr size_t OTA_MAX_DIGEST_CHUNK_SIZE = 18;
+constexpr size_t OTA_MAX_DATA_VALUE_SIZE = 244;
+constexpr size_t OTA_WORKAREA_SIZE = 4096;
+constexpr uint32_t OTA_FLASH_SECTOR_SIZE = 4096;
+constexpr uint32_t OTA_FLASH_PAGE_SIZE = 256;
+
+enum class OtaState : uint8_t {
+    IDLE = 0,
+    RECEIVING = 1,
+    READY = 2,
+    ERROR = 3,
+    REBOOTING = 4,
+    PREPARING = 5,
+};
+
+enum class OtaError : uint8_t {
+    NONE = 0,
+    INVALID_REQUEST = 1,
+    NO_PARTITION = 2,
+    HASH_UNAVAILABLE = 3,
+    INVALID_UF2 = 4,
+    OUT_OF_ORDER = 5,
+    OUT_OF_RANGE = 6,
+    FLASH_OPERATION = 7,
+    HASH_MISMATCH = 8,
+    DISCONNECTED = 9,
+};
+
+struct OtaControlPacket {
+    uint8_t length;
+    uint8_t bytes[OTA_MAX_CONTROL_PACKET_SIZE];
+};
+
+struct OtaDataPacket {
+    uint16_t length;
+    uint8_t bytes[OTA_MAX_DATA_VALUE_SIZE];
+};
+
+queue_t ota_control_queue;
+queue_t ota_data_queue;
+volatile OtaState ota_state = OtaState::IDLE;
+volatile OtaError ota_error = OtaError::NONE;
+volatile bool ota_abort_requested = false;
+volatile bool bluetooth_ready = false;
+bool pending_update_confirmation = false;
+bool update_confirmation_attempted = false;
+bool ota_sha_active = false;
+uint8_t ota_expected_sha256[OTA_SHA256_SIZE] = {0};
+uint32_t ota_digest_bytes_received = 0;
+uint8_t ota_uf2_block_bytes[sizeof(uf2_block)] = {0};
+uint32_t ota_uf2_block_used = 0;
+uint32_t ota_total_bytes = 0;
+uint32_t ota_bytes_received = 0;
+uint32_t ota_blocks_received = 0;
+uint32_t ota_target_partition = 0xff;
+uint32_t ota_target_storage_base = 0;
+uint32_t ota_target_storage_end = 0;
+uint32_t ota_last_erased_sector = UINT32_MAX;
+pico_sha256_state_t ota_sha_state;
+alignas(4) uint8_t ota_workarea[OTA_WORKAREA_SIZE];
+
+#ifdef __riscv
+alignas(4) uint32_t bootrom_stack_words[256];
+bootrom_stack_t bootrom_stack = {
+    bootrom_stack_words,
+    sizeof(bootrom_stack_words),
+};
+#endif
 
 // Bluetooth telemetry uses signed milli-g for acceleration and signed
 // deci-degrees/second for angular velocity, all in the physical sensor frame.
@@ -564,6 +650,415 @@ void advance_gait_phase() {
     }
 }
 
+uint32_t read_little_endian_u32(const uint8_t *bytes) {
+    return static_cast<uint32_t>(bytes[0]) |
+           (static_cast<uint32_t>(bytes[1]) << 8) |
+           (static_cast<uint32_t>(bytes[2]) << 16) |
+           (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+void write_little_endian_u32(uint8_t *bytes, uint32_t value) {
+    bytes[0] = static_cast<uint8_t>(value);
+    bytes[1] = static_cast<uint8_t>(value >> 8);
+    bytes[2] = static_cast<uint8_t>(value >> 16);
+    bytes[3] = static_cast<uint8_t>(value >> 24);
+}
+
+bool ota_locks_robot() {
+    return ota_state == OtaState::PREPARING ||
+           ota_state == OtaState::RECEIVING ||
+           ota_state == OtaState::READY ||
+           ota_state == OtaState::REBOOTING;
+}
+
+void drain_ota_data_queue() {
+    OtaDataPacket discarded;
+    while (queue_try_remove(&ota_data_queue, &discarded)) {
+    }
+}
+
+void stop_robot_for_update() {
+    stop_requested = false;
+    robot_running = false;
+    servo_calibration_active = false;
+    run_control_step = false;
+    control_state = CONTROL_STATE_STOPPED;
+
+    uint8_t discarded_control;
+    while (queue_try_remove(&control_command_queue, &discarded_control)) {
+    }
+    ServoCalibrationCommand discarded_calibration;
+    while (queue_try_remove(
+        &servo_calibration_command_queue, &discarded_calibration)) {
+    }
+}
+
+void ota_cleanup_hash() {
+    if (ota_sha_active) {
+        pico_sha256_cleanup(&ota_sha_state);
+        ota_sha_active = false;
+    }
+}
+
+void ota_fail(OtaError error) {
+    ota_cleanup_hash();
+    drain_ota_data_queue();
+    ota_error = error;
+    ota_state = OtaState::ERROR;
+    printf(
+        "Firmware update stopped with error %u after %lu bytes.\n",
+        static_cast<unsigned>(error),
+        static_cast<unsigned long>(ota_bytes_received));
+}
+
+void ota_reset() {
+    ota_cleanup_hash();
+    drain_ota_data_queue();
+    ota_uf2_block_used = 0;
+    ota_digest_bytes_received = 0;
+    ota_total_bytes = 0;
+    ota_bytes_received = 0;
+    ota_blocks_received = 0;
+    ota_target_partition = 0xff;
+    ota_target_storage_base = 0;
+    ota_target_storage_end = 0;
+    ota_last_erased_sector = UINT32_MAX;
+    ota_error = OtaError::NONE;
+    ota_state = OtaState::IDLE;
+}
+
+void initialize_bootrom_support() {
+#ifdef __riscv
+    const int stack_result = rom_set_bootrom_stack(&bootrom_stack);
+    if (stack_result != BOOTROM_OK) {
+        printf("Could not install the RP2350 boot ROM stack (%d).\n", stack_result);
+    }
+#endif
+
+    pending_update_confirmation =
+        rom_get_last_boot_type() == BOOT_TYPE_FLASH_UPDATE;
+    if (pending_update_confirmation) {
+        printf("Firmware is running in the try-before-you-buy window.\n");
+    }
+}
+
+void confirm_pending_update_if_ready() {
+    if (!pending_update_confirmation || update_confirmation_attempted ||
+        !bluetooth_ready) {
+        return;
+    }
+
+    update_confirmation_attempted = true;
+    const int result = rom_explicit_buy(ota_workarea, sizeof(ota_workarea));
+    if (result == BOOTROM_OK) {
+        pending_update_confirmation = false;
+        printf("Firmware update accepted; this partition is now permanent.\n");
+    } else {
+        // Do not disable the TBYB watchdog. A failed confirmation must fall
+        // back to the previously working partition.
+        printf("Firmware update confirmation failed (%d); rollback remains armed.\n", result);
+    }
+}
+
+void begin_ota_update(const OtaControlPacket &packet) {
+    if (packet.length != OTA_BEGIN_PACKET_SIZE ||
+        pending_update_confirmation) {
+        ota_fail(OtaError::INVALID_REQUEST);
+        return;
+    }
+
+    const uint32_t total_bytes = read_little_endian_u32(&packet.bytes[1]);
+    const uint32_t family_id = read_little_endian_u32(&packet.bytes[5]);
+    if (total_bytes == 0 || total_bytes % sizeof(uf2_block) != 0 ||
+        family_id != RP2350_RISCV_FAMILY_ID) {
+        ota_fail(OtaError::INVALID_REQUEST);
+        return;
+    }
+
+    ota_reset();
+    stop_robot_for_update();
+
+    resident_partition_t target_partition = {};
+    rom_flash_flush_cache();
+    const int partition_result = rom_get_uf2_target_partition(
+        ota_workarea,
+        sizeof(ota_workarea),
+        family_id,
+        &target_partition);
+    if (partition_result < 0) {
+        ota_fail(OtaError::NO_PARTITION);
+        return;
+    }
+
+    const uint16_t first_sector = static_cast<uint16_t>(
+        (target_partition.permissions_and_location &
+         PICOBIN_PARTITION_LOCATION_FIRST_SECTOR_BITS) >>
+        PICOBIN_PARTITION_LOCATION_FIRST_SECTOR_LSB);
+    const uint16_t last_sector = static_cast<uint16_t>(
+        (target_partition.permissions_and_location &
+         PICOBIN_PARTITION_LOCATION_LAST_SECTOR_BITS) >>
+        PICOBIN_PARTITION_LOCATION_LAST_SECTOR_LSB);
+    if (last_sector < first_sector) {
+        ota_fail(OtaError::NO_PARTITION);
+        return;
+    }
+
+    ota_target_storage_base =
+        XIP_BASE + static_cast<uint32_t>(first_sector) * OTA_FLASH_SECTOR_SIZE;
+    ota_target_storage_end =
+        XIP_BASE + (static_cast<uint32_t>(last_sector) + 1) *
+                       OTA_FLASH_SECTOR_SIZE;
+    const uint32_t partition_size =
+        ota_target_storage_end - ota_target_storage_base;
+    const uint32_t block_count = total_bytes / sizeof(uf2_block);
+    if (static_cast<uint64_t>(block_count) * OTA_FLASH_PAGE_SIZE >
+        partition_size) {
+        ota_fail(OtaError::OUT_OF_RANGE);
+        return;
+    }
+
+    const int sha_result = pico_sha256_start_blocking(
+        &ota_sha_state, SHA256_BIG_ENDIAN, false);
+    if (sha_result != PICO_OK) {
+        ota_fail(OtaError::HASH_UNAVAILABLE);
+        return;
+    }
+
+    ota_sha_active = true;
+    ota_total_bytes = total_bytes;
+    ota_target_partition = static_cast<uint32_t>(partition_result);
+    std::memset(ota_expected_sha256, 0, sizeof(ota_expected_sha256));
+    ota_error = OtaError::NONE;
+    ota_state = OtaState::PREPARING;
+    printf(
+        "Firmware update prepared: %lu UF2 blocks to partition %d.\n",
+        static_cast<unsigned long>(block_count),
+        partition_result);
+}
+
+void receive_ota_digest(const OtaControlPacket &packet) {
+    if (ota_state != OtaState::PREPARING || packet.length <= 2 ||
+        packet.length > OTA_MAX_CONTROL_PACKET_SIZE) {
+        ota_fail(OtaError::INVALID_REQUEST);
+        return;
+    }
+
+    const uint32_t digest_offset = packet.bytes[1];
+    const uint32_t digest_length = packet.length - 2;
+    if (digest_length > OTA_MAX_DIGEST_CHUNK_SIZE ||
+        digest_offset != ota_digest_bytes_received ||
+        digest_offset + digest_length > sizeof(ota_expected_sha256)) {
+        ota_fail(OtaError::OUT_OF_ORDER);
+        return;
+    }
+
+    std::memcpy(
+        &ota_expected_sha256[digest_offset],
+        &packet.bytes[2],
+        digest_length);
+    ota_digest_bytes_received += digest_length;
+    if (ota_digest_bytes_received == sizeof(ota_expected_sha256)) {
+        ota_state = OtaState::RECEIVING;
+        printf("Firmware update digest received; accepting UF2 data.\n");
+    }
+}
+
+bool program_ota_uf2_block() {
+    const uf2_block *block =
+        reinterpret_cast<const uf2_block *>(ota_uf2_block_bytes);
+    const uint32_t expected_block_count =
+        ota_total_bytes / sizeof(uf2_block);
+    const uint32_t expected_target_address =
+        XIP_BASE + ota_blocks_received * OTA_FLASH_PAGE_SIZE;
+
+    if (block->magic_start0 != UF2_MAGIC_START0 ||
+        block->magic_start1 != UF2_MAGIC_START1 ||
+        block->magic_end != UF2_MAGIC_END ||
+        (block->flags & UF2_FLAG_FAMILY_ID_PRESENT) == 0 ||
+        (block->flags & UF2_FLAG_NOT_MAIN_FLASH) != 0 ||
+        block->file_size != RP2350_RISCV_FAMILY_ID ||
+        block->payload_size != OTA_FLASH_PAGE_SIZE ||
+        block->block_no != ota_blocks_received ||
+        block->num_blocks != expected_block_count ||
+        block->target_addr != expected_target_address) {
+        ota_fail(OtaError::INVALID_UF2);
+        return false;
+    }
+
+    const uint32_t target_address =
+        ota_target_storage_base + (block->target_addr - XIP_BASE);
+    if (target_address < ota_target_storage_base ||
+        target_address + OTA_FLASH_PAGE_SIZE > ota_target_storage_end) {
+        ota_fail(OtaError::OUT_OF_RANGE);
+        return false;
+    }
+
+    const uint32_t sector_address =
+        target_address & ~(OTA_FLASH_SECTOR_SIZE - 1);
+    cflash_flags_t flags = {};
+    int result;
+    if (sector_address != ota_last_erased_sector) {
+        flags.flags =
+            (CFLASH_OP_VALUE_ERASE << CFLASH_OP_LSB) |
+            (CFLASH_SECLEVEL_VALUE_SECURE << CFLASH_SECLEVEL_LSB) |
+            (CFLASH_ASPACE_VALUE_STORAGE << CFLASH_ASPACE_LSB);
+        result = rom_flash_op(
+            flags, sector_address, OTA_FLASH_SECTOR_SIZE, nullptr);
+        if (result != BOOTROM_OK) {
+            ota_fail(OtaError::FLASH_OPERATION);
+            return false;
+        }
+        ota_last_erased_sector = sector_address;
+    }
+
+    flags.flags =
+        (CFLASH_OP_VALUE_PROGRAM << CFLASH_OP_LSB) |
+        (CFLASH_SECLEVEL_VALUE_SECURE << CFLASH_SECLEVEL_LSB) |
+        (CFLASH_ASPACE_VALUE_STORAGE << CFLASH_ASPACE_LSB);
+    result = rom_flash_op(
+        flags,
+        target_address,
+        OTA_FLASH_PAGE_SIZE,
+        const_cast<uint8_t *>(block->data));
+    if (result != BOOTROM_OK) {
+        ota_fail(OtaError::FLASH_OPERATION);
+        return false;
+    }
+
+    ++ota_blocks_received;
+    ota_uf2_block_used = 0;
+    return true;
+}
+
+void finish_ota_receive() {
+    if (!ota_sha_active || ota_uf2_block_used != 0 ||
+        ota_blocks_received != ota_total_bytes / sizeof(uf2_block)) {
+        ota_fail(OtaError::INVALID_UF2);
+        return;
+    }
+
+    sha256_result_t actual_sha256;
+    pico_sha256_finish(&ota_sha_state, &actual_sha256);
+    ota_sha_active = false;
+    if (std::memcmp(
+            actual_sha256.bytes,
+            ota_expected_sha256,
+            sizeof(ota_expected_sha256)) != 0) {
+        ota_fail(OtaError::HASH_MISMATCH);
+        return;
+    }
+
+    ota_state = OtaState::READY;
+    printf("Firmware image verified and ready to boot.\n");
+}
+
+void process_ota_data_packet(const OtaDataPacket &packet) {
+    if (ota_state != OtaState::RECEIVING || packet.length <= 4) {
+        return;
+    }
+
+    const uint32_t stream_offset = read_little_endian_u32(packet.bytes);
+    const uint32_t data_length = packet.length - 4;
+    if (stream_offset != ota_bytes_received) {
+        ota_fail(OtaError::OUT_OF_ORDER);
+        return;
+    }
+    if (data_length > ota_total_bytes - ota_bytes_received) {
+        ota_fail(OtaError::OUT_OF_RANGE);
+        return;
+    }
+
+    pico_sha256_update_blocking(
+        &ota_sha_state, &packet.bytes[4], data_length);
+
+    uint32_t source_offset = 0;
+    while (source_offset < data_length &&
+           ota_state == OtaState::RECEIVING) {
+        const uint32_t copy_size = std::min(
+            data_length - source_offset,
+            static_cast<uint32_t>(sizeof(uf2_block)) - ota_uf2_block_used);
+        std::memcpy(
+            &ota_uf2_block_bytes[ota_uf2_block_used],
+            &packet.bytes[4 + source_offset],
+            copy_size);
+        ota_uf2_block_used += copy_size;
+        ota_bytes_received += copy_size;
+        source_offset += copy_size;
+
+        if (ota_uf2_block_used == sizeof(uf2_block) &&
+            !program_ota_uf2_block()) {
+            return;
+        }
+    }
+
+    if (ota_bytes_received == ota_total_bytes) {
+        finish_ota_receive();
+    }
+}
+
+void process_ota_control_packets() {
+    OtaControlPacket packet;
+    while (queue_try_remove(&ota_control_queue, &packet)) {
+        if (packet.length == 0) {
+            continue;
+        }
+
+        switch (packet.bytes[0]) {
+            case OTA_CONTROL_BEGIN:
+                begin_ota_update(packet);
+                break;
+
+            case OTA_CONTROL_ABORT:
+                ota_reset();
+                printf("Firmware update aborted.\n");
+                break;
+
+            case OTA_CONTROL_COMMIT:
+                if (packet.length != 1 || ota_state != OtaState::READY) {
+                    ota_fail(OtaError::INVALID_REQUEST);
+                    break;
+                }
+                ota_state = OtaState::REBOOTING;
+                printf("Rebooting into the verified firmware image.\n");
+                rom_reboot(
+                    REBOOT2_FLAG_REBOOT_TYPE_FLASH_UPDATE,
+                    1000,
+                    ota_target_storage_base,
+                    0);
+                break;
+
+            case OTA_CONTROL_DIGEST:
+                receive_ota_digest(packet);
+                break;
+
+            default:
+                ota_fail(OtaError::INVALID_REQUEST);
+                break;
+        }
+    }
+}
+
+void process_ota_data_packets() {
+    OtaDataPacket packet;
+    // Limit work per pass so Bluetooth and the safety stop remain responsive.
+    for (int count = 0;
+         count < 4 && queue_try_remove(&ota_data_queue, &packet);
+         ++count) {
+        process_ota_data_packet(packet);
+    }
+}
+
+void process_ota_abort_request() {
+    if (!ota_abort_requested) {
+        return;
+    }
+    ota_abort_requested = false;
+    if (ota_state == OtaState::PREPARING ||
+        ota_state == OtaState::RECEIVING) {
+        ota_fail(OtaError::DISCONNECTED);
+    }
+}
+
 bool control_loop_callback(struct repeating_timer *) {
     run_control_step = true;
     return true;
@@ -617,6 +1112,25 @@ uint16_t bluetooth_read_callback(
             buffer_size);
     }
 
+    if (attribute_handle ==
+        ATT_CHARACTERISTIC_7E57A007_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        uint8_t status_bytes[16] = {
+            OTA_PROTOCOL_VERSION,
+            static_cast<uint8_t>(ota_state),
+            static_cast<uint8_t>(ota_error),
+            static_cast<uint8_t>(ota_target_partition),
+        };
+        write_little_endian_u32(&status_bytes[4], ota_bytes_received);
+        write_little_endian_u32(&status_bytes[8], ota_total_bytes);
+        write_little_endian_u32(&status_bytes[12], ota_blocks_received);
+        return att_read_callback_handle_blob(
+            status_bytes,
+            sizeof(status_bytes),
+            offset,
+            buffer,
+            buffer_size);
+    }
+
     return 0;
 }
 
@@ -637,7 +1151,55 @@ int bluetooth_write_callback(
     }
 
     if (attribute_handle ==
+        ATT_CHARACTERISTIC_7E57A005_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        if (buffer_size == 0 || buffer_size > OTA_MAX_CONTROL_PACKET_SIZE) {
+            return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        }
+
+        const bool valid_size =
+            (buffer[0] == OTA_CONTROL_BEGIN &&
+             buffer_size == OTA_BEGIN_PACKET_SIZE) ||
+            (buffer[0] == OTA_CONTROL_DIGEST &&
+             buffer_size > 2) ||
+            ((buffer[0] == OTA_CONTROL_ABORT ||
+              buffer[0] == OTA_CONTROL_COMMIT) &&
+             buffer_size == 1);
+        if (!valid_size) {
+            return ATT_ERROR_VALUE_NOT_ALLOWED;
+        }
+
+        OtaControlPacket packet = {};
+        packet.length = static_cast<uint8_t>(buffer_size);
+        std::memcpy(packet.bytes, buffer, buffer_size);
+        if (!queue_try_add(&ota_control_queue, &packet)) {
+            return ATT_ERROR_INSUFFICIENT_RESOURCES;
+        }
+        return 0;
+    }
+
+    if (attribute_handle ==
+        ATT_CHARACTERISTIC_7E57A006_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        if (buffer_size <= 4 || buffer_size > OTA_MAX_DATA_VALUE_SIZE) {
+            return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        }
+        if (ota_state != OtaState::RECEIVING) {
+            return ATT_ERROR_WRITE_REQUEST_REJECTED;
+        }
+
+        OtaDataPacket packet = {};
+        packet.length = buffer_size;
+        std::memcpy(packet.bytes, buffer, buffer_size);
+        if (!queue_try_add(&ota_data_queue, &packet)) {
+            return ATT_ERROR_INSUFFICIENT_RESOURCES;
+        }
+        return 0;
+    }
+
+    if (attribute_handle ==
         ATT_CHARACTERISTIC_7E57A002_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        if (ota_locks_robot()) {
+            return ATT_ERROR_WRITE_REQUEST_REJECTED;
+        }
         if (buffer_size != 1) {
             return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
         }
@@ -659,6 +1221,9 @@ int bluetooth_write_callback(
 
     if (attribute_handle ==
         ATT_CHARACTERISTIC_7E57A004_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        if (ota_locks_robot()) {
+            return ATT_ERROR_WRITE_REQUEST_REJECTED;
+        }
         if (buffer_size != 3) {
             return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
         }
@@ -721,6 +1286,7 @@ void bluetooth_packet_handler(
     switch (hci_event_packet_get_type(packet)) {
         case BTSTACK_EVENT_STATE:
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+                bluetooth_ready = true;
                 bd_addr_t local_address;
                 gap_local_bd_addr(local_address);
                 printf(
@@ -748,6 +1314,7 @@ void bluetooth_packet_handler(
                 bluetooth_connection_handle) {
                 bluetooth_connection_handle = HCI_CON_HANDLE_INVALID;
                 stop_requested = true;
+                ota_abort_requested = true;
                 printf("Bluetooth disconnected; stopping policy.\n");
                 gap_advertisements_enable(1);
             }
@@ -798,6 +1365,7 @@ bool init_bluetooth() {
 
 int main() {
     stdio_init_all();
+    initialize_bootrom_support();
     printf(
         "Starting Rick Pico policy checkpoint %u (%d obs, %d actions)...\n",
         static_cast<unsigned>(POLICY_CHECKPOINT_STEP),
@@ -811,6 +1379,8 @@ int main() {
         &servo_calibration_command_queue,
         sizeof(ServoCalibrationCommand),
         8);
+    queue_init(&ota_control_queue, sizeof(OtaControlPacket), 4);
+    queue_init(&ota_data_queue, sizeof(OtaDataPacket), 8);
     reset_servos(0.0f);
     control_state = CONTROL_STATE_DEFAULT;
 
@@ -832,11 +1402,22 @@ int main() {
     float az;
 
     while (true) {
-        process_control_commands();
-        process_servo_calibration_commands();
+        confirm_pending_update_if_ready();
+        process_ota_abort_request();
+        process_ota_control_packets();
+        process_ota_data_packets();
+
+        if (!ota_locks_robot()) {
+            process_control_commands();
+            process_servo_calibration_commands();
+        }
 
         if (run_control_step) {
             run_control_step = false;
+            if (ota_locks_robot()) {
+                tight_loop_contents();
+                continue;
+            }
             read_imu(&gx, &gy, &gz, &ax, &ay, &az);
 
             if (robot_running) {

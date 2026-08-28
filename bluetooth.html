@@ -443,6 +443,70 @@
       white-space: pre;
     }
 
+    .firmware-picker {
+      width: 100%;
+      min-height: 44px;
+      padding: 10px;
+      border: 1px dashed #535049;
+      border-radius: 12px;
+      background: #171715;
+      color: var(--muted);
+      font: 600 0.76rem/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .firmware-picker::file-selector-button {
+      min-height: 32px;
+      margin-right: 10px;
+      padding: 0 11px;
+      border: 0;
+      border-radius: 8px;
+      background: var(--paper);
+      color: var(--ink);
+      font: 750 0.74rem/1 ui-sans-serif, system-ui, sans-serif;
+    }
+
+    .firmware-file {
+      min-height: 39px;
+      margin: 12px 0 0;
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #171715;
+      color: var(--muted);
+      font-size: 0.75rem;
+      line-height: 1.4;
+    }
+
+    .firmware-file.ready { color: var(--paper); }
+
+    .firmware-progress {
+      width: 100%;
+      height: 8px;
+      margin-top: 13px;
+      overflow: hidden;
+      border: 0;
+      border-radius: 999px;
+      background: #10100f;
+      accent-color: var(--orange);
+    }
+
+    .firmware-progress::-webkit-progress-bar {
+      border-radius: 999px;
+      background: #10100f;
+    }
+
+    .firmware-progress::-webkit-progress-value {
+      border-radius: 999px;
+      background: var(--orange);
+    }
+
+    .firmware-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 13px;
+    }
+
     .hidden { display: none; }
 
     .safety {
@@ -603,6 +667,27 @@
       <pre class="code-output hidden" id="centerCode"></pre>
     </section>
 
+    <section class="card tool-card" aria-labelledby="firmwareHeading">
+      <div class="tool-heading">
+        <div>
+          <h2 id="firmwareHeading">Firmware update</h2>
+          <p>Install a new Rick Pico UF2 over the encrypted Bluetooth connection.</p>
+        </div>
+        <span class="tool-status" id="firmwareStatus">WAITING</span>
+      </div>
+
+      <input class="firmware-picker" id="firmwareFile" type="file" accept=".uf2,application/octet-stream" disabled>
+      <p class="firmware-file" id="firmwareFileDetail">Connect to an OTA-enabled RickBot, then choose rick_v2_pico.uf2.</p>
+      <progress class="firmware-progress" id="firmwareProgress" value="0" max="1" aria-label="Firmware upload progress"></progress>
+      <p class="tool-note" id="firmwareProgressText" role="status" aria-live="polite">No update in progress.</p>
+
+      <div class="firmware-actions">
+        <button class="small-button primary" id="installFirmware" type="button" disabled>Install firmware</button>
+        <button class="small-button" id="abortFirmware" type="button" hidden>Abort update</button>
+      </div>
+      <p class="tool-note">Updating immediately stops the policy and holds the current pose. Keep power connected until RickBot reboots; an interrupted upload leaves the current firmware bootable.</p>
+    </section>
+
     <p class="safety">Support the robot off the ground during calibration and first use. Keep people and cables clear before pressing Start. A Bluetooth disconnect stops the policy and holds the last pose.</p>
   </main>
 
@@ -613,6 +698,43 @@
     const CONTROL_UUID = "7e57a002-4c91-4d8e-8f2a-7dca6d5a1000";
     const IMU_UUID = "7e57a003-4c91-4d8e-8f2a-7dca6d5a1000";
     const SERVO_UUID = "7e57a004-4c91-4d8e-8f2a-7dca6d5a1000";
+    const OTA_CONTROL_UUID = "7e57a005-4c91-4d8e-8f2a-7dca6d5a1000";
+    const OTA_DATA_UUID = "7e57a006-4c91-4d8e-8f2a-7dca6d5a1000";
+    const OTA_STATUS_UUID = "7e57a007-4c91-4d8e-8f2a-7dca6d5a1000";
+
+    const OTA_PROTOCOL_VERSION = 1;
+    const OTA_CONTROL_BEGIN = 1;
+    const OTA_CONTROL_ABORT = 2;
+    const OTA_CONTROL_COMMIT = 3;
+    const OTA_CONTROL_DIGEST = 4;
+    const OTA_STATE_IDLE = 0;
+    const OTA_STATE_RECEIVING = 1;
+    const OTA_STATE_READY = 2;
+    const OTA_STATE_ERROR = 3;
+    const OTA_STATE_REBOOTING = 4;
+    const OTA_STATE_PREPARING = 5;
+    const OTA_DATA_CHUNK_SIZES = [240, 120, 60, 16];
+    const UF2_BLOCK_SIZE = 512;
+    const UF2_PAYLOAD_SIZE = 256;
+    const UF2_MAGIC_START0 = 0x0a324655;
+    const UF2_MAGIC_START1 = 0x9e5d5157;
+    const UF2_MAGIC_END = 0x0ab16f30;
+    const UF2_FLAG_FAMILY_ID_PRESENT = 0x00002000;
+    const UF2_ABSOLUTE_FAMILY = 0xe48bff57;
+    const UF2_RP2350_RISCV_FAMILY = 0xe48bff5a;
+
+    const otaErrorLabels = [
+      "No error",
+      "The update request was invalid",
+      "The inactive firmware partition is unavailable",
+      "SHA-256 verification could not start",
+      "The UF2 structure is invalid",
+      "An update chunk arrived out of order",
+      "The firmware does not fit the update partition",
+      "Flash programming failed",
+      "The completed upload did not match its SHA-256 hash",
+      "Bluetooth disconnected during the upload"
+    ];
 
     const servoNames = [
       "Left roll", "Left upper", "Left lower", "Left foot",
@@ -652,13 +774,27 @@
     const copyCenters = document.getElementById("copyCenters");
     const centerCode = document.getElementById("centerCode");
     const installButton = document.getElementById("installButton");
+    const firmwareFileInput = document.getElementById("firmwareFile");
+    const firmwareFileDetail = document.getElementById("firmwareFileDetail");
+    const firmwareStatus = document.getElementById("firmwareStatus");
+    const firmwareProgress = document.getElementById("firmwareProgress");
+    const firmwareProgressText = document.getElementById("firmwareProgressText");
+    const installFirmware = document.getElementById("installFirmware");
+    const abortFirmware = document.getElementById("abortFirmware");
     const bluetoothSupported = "bluetooth" in navigator;
 
     let device = null;
     let controlCharacteristic = null;
     let imuCharacteristic = null;
     let servoCharacteristic = null;
+    let otaControlCharacteristic = null;
+    let otaDataCharacteristic = null;
+    let otaStatusCharacteristic = null;
     let busy = false;
+    let otaUpdating = false;
+    let otaCancelRequested = false;
+    let otaCommitSent = false;
+    let selectedFirmware = null;
     let imuReadPending = false;
     let imuPollTimer = null;
     let gattOperationQueue = Promise.resolve();
@@ -719,6 +855,31 @@
       );
     }
 
+    function otaIsAvailable() {
+      return Boolean(
+        isConnected() && otaControlCharacteristic &&
+        otaDataCharacteristic && otaStatusCharacteristic
+      );
+    }
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+      return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+    }
+
+    function showFirmwareProgress(value, maximum, text) {
+      firmwareProgress.max = Math.max(1, maximum);
+      firmwareProgress.value = Math.min(value, firmwareProgress.max);
+      firmwareProgressText.textContent = text;
+    }
+
+    function showFirmwareStatus(label, detail, ready = false) {
+      firmwareStatus.textContent = label;
+      firmwareFileDetail.textContent = detail;
+      firmwareFileDetail.classList.toggle("ready", ready);
+    }
+
     function setMessage(text, isError = false) {
       message.textContent = text;
       message.classList.toggle("error", isError);
@@ -734,6 +895,11 @@
       copyCenters.disabled = busy;
       connectButton.disabled = busy || !bluetoothSupported;
       connectButton.textContent = isConnected() ? "Disconnect" : "Pair & connect";
+      firmwareFileInput.disabled = !otaIsAvailable() || busy;
+      installFirmware.disabled =
+        !otaIsAvailable() || !selectedFirmware || busy || otaUpdating;
+      abortFirmware.hidden = !otaUpdating;
+      abortFirmware.disabled = !otaUpdating || !isConnected();
     }
 
     function showConnection(status, detail, mode = "") {
@@ -822,6 +988,322 @@
       });
     }
 
+    function otaStatusError(status) {
+      const detail = otaErrorLabels[status.error] || `Firmware error ${status.error}`;
+      const error = new Error(detail);
+      error.otaFatal = true;
+      return error;
+    }
+
+    async function readOtaStatus() {
+      if (!otaStatusCharacteristic) throw new Error("Wireless updates are unavailable");
+      const characteristic = otaStatusCharacteristic;
+      const value = await queueGattOperation(() => characteristic.readValue());
+      if (value.byteLength < 16) throw new Error("Firmware update status was incomplete");
+      if (value.getUint8(0) !== OTA_PROTOCOL_VERSION) {
+        throw new Error("RickBot uses an incompatible update protocol");
+      }
+      return {
+        state: value.getUint8(1),
+        error: value.getUint8(2),
+        targetPartition: value.getUint8(3),
+        received: value.getUint32(4, true),
+        total: value.getUint32(8, true),
+        blocks: value.getUint32(12, true)
+      };
+    }
+
+    async function waitForOtaState(states, timeoutMs) {
+      const wanted = new Set(states);
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const status = await readOtaStatus();
+        if (status.state === OTA_STATE_ERROR) throw otaStatusError(status);
+        if (wanted.has(status.state)) return status;
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
+      throw new Error("RickBot did not finish the update step in time");
+    }
+
+    async function parseUf2Firmware(file) {
+      if (!globalThis.crypto?.subtle) {
+        throw new Error("SHA-256 requires opening Rick Control from its HTTPS address");
+      }
+
+      const fileBytes = new Uint8Array(await file.arrayBuffer());
+      if (fileBytes.byteLength === 0 || fileBytes.byteLength % UF2_BLOCK_SIZE !== 0) {
+        throw new Error("The selected file is not a complete UF2 image");
+      }
+
+      const codeBlocks = [];
+      let expectedCodeBlocks = null;
+      for (let offset = 0; offset < fileBytes.byteLength; offset += UF2_BLOCK_SIZE) {
+        const view = new DataView(
+          fileBytes.buffer,
+          fileBytes.byteOffset + offset,
+          UF2_BLOCK_SIZE
+        );
+        if (view.getUint32(0, true) !== UF2_MAGIC_START0 ||
+            view.getUint32(4, true) !== UF2_MAGIC_START1 ||
+            view.getUint32(508, true) !== UF2_MAGIC_END) {
+          throw new Error(`UF2 block ${offset / UF2_BLOCK_SIZE} has invalid magic values`);
+        }
+
+        const flags = view.getUint32(8, true);
+        const family = view.getUint32(28, true);
+        if (family === UF2_ABSOLUTE_FAMILY) continue;
+        if (family !== UF2_RP2350_RISCV_FAMILY) {
+          throw new Error("Choose the RISC-V rick_v2_pico.uf2 build for Pico 2 W");
+        }
+        if ((flags & UF2_FLAG_FAMILY_ID_PRESENT) === 0 ||
+            view.getUint32(16, true) !== UF2_PAYLOAD_SIZE) {
+          throw new Error("The UF2 contains an unsupported firmware block");
+        }
+
+        const blockNumber = view.getUint32(20, true);
+        const blockCount = view.getUint32(24, true);
+        const targetAddress = view.getUint32(12, true);
+        if (blockNumber !== codeBlocks.length ||
+            targetAddress !== 0x10000000 + blockNumber * UF2_PAYLOAD_SIZE) {
+          throw new Error("The UF2 firmware blocks are missing or out of order");
+        }
+        if (expectedCodeBlocks === null) expectedCodeBlocks = blockCount;
+        if (blockCount !== expectedCodeBlocks) {
+          throw new Error("The UF2 block count is inconsistent");
+        }
+        codeBlocks.push(fileBytes.slice(offset, offset + UF2_BLOCK_SIZE));
+      }
+
+      if (codeBlocks.length === 0 || codeBlocks.length !== expectedCodeBlocks) {
+        throw new Error("The UF2 does not contain a complete Pico 2 W RISC-V image");
+      }
+
+      const stream = new Uint8Array(codeBlocks.length * UF2_BLOCK_SIZE);
+      codeBlocks.forEach((block, index) => {
+        stream.set(block, index * UF2_BLOCK_SIZE);
+      });
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", stream));
+      return {
+        name: file.name,
+        stream,
+        digest,
+        family: UF2_RP2350_RISCV_FAMILY,
+        codeSize: codeBlocks.length * UF2_PAYLOAD_SIZE,
+        blockCount: codeBlocks.length
+      };
+    }
+
+    async function chooseFirmware() {
+      const file = firmwareFileInput.files?.[0];
+      selectedFirmware = null;
+      showFirmwareProgress(0, 1, "Inspecting and hashing the selected UF2…");
+      showFirmwareStatus("CHECKING", file?.name || "No file selected");
+      updateButtons();
+
+      if (!file) {
+        showFirmwareStatus("WAITING", "Choose rick_v2_pico.uf2 to prepare an update.");
+        showFirmwareProgress(0, 1, "No update in progress.");
+        updateButtons();
+        return;
+      }
+
+      try {
+        selectedFirmware = await parseUf2Firmware(file);
+        showFirmwareStatus(
+          "READY",
+          `${selectedFirmware.name} · ${formatBytes(selectedFirmware.codeSize)} firmware · ${formatBytes(selectedFirmware.stream.byteLength)} BLE transfer`,
+          true
+        );
+        showFirmwareProgress(0, selectedFirmware.stream.byteLength, "Verified locally and ready to upload.");
+      } catch (error) {
+        firmwareFileInput.value = "";
+        showFirmwareStatus("INVALID", error.message || error.name);
+        showFirmwareProgress(0, 1, "Choose a different UF2 file.");
+      }
+      updateButtons();
+    }
+
+    async function sendOtaChunk(stream, offset, chunkSize) {
+      const length = Math.min(chunkSize, stream.byteLength - offset);
+      const packet = new Uint8Array(4 + length);
+      new DataView(packet.buffer).setUint32(0, offset, true);
+      packet.set(stream.subarray(offset, offset + length), 4);
+
+      try {
+        await writeWithResponse(otaDataCharacteristic, packet);
+        return length;
+      } catch (writeError) {
+        // A lost ATT response does not necessarily mean the write was lost.
+        // Ask the Pico before retrying so an accepted chunk is never sent twice.
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        try {
+          const status = await readOtaStatus();
+          if (status.state === OTA_STATE_ERROR) throw otaStatusError(status);
+          if (status.received >= offset + length) return length;
+        } catch (statusError) {
+          if (statusError.otaFatal) throw statusError;
+        }
+        throw writeError;
+      }
+    }
+
+    async function installSelectedFirmware() {
+      if (!selectedFirmware || !otaIsAvailable() || busy) return;
+      if (!window.confirm(
+        "Install this firmware now? RickBot will stop moving, hold its current pose, and reboot when verification succeeds."
+      )) return;
+
+      busy = true;
+      otaUpdating = true;
+      otaCancelRequested = false;
+      otaCommitSent = false;
+      stopImuPolling();
+      showConnection("Updating…", "Policy stopped · keep RickBot powered", "working");
+      setMessage("Preparing the inactive firmware partition…");
+      showFirmwareStatus("STARTING", selectedFirmware.name, true);
+      showFirmwareProgress(0, selectedFirmware.stream.byteLength, "Preparing RickBot for the upload…");
+      updateButtons();
+
+      try {
+        const beginPacket = new Uint8Array(9);
+        const beginView = new DataView(beginPacket.buffer);
+        beginView.setUint8(0, OTA_CONTROL_BEGIN);
+        beginView.setUint32(1, selectedFirmware.stream.byteLength, true);
+        beginView.setUint32(5, selectedFirmware.family, true);
+        await writeWithResponse(otaControlCharacteristic, beginPacket);
+
+        for (let digestOffset = 0;
+             digestOffset < selectedFirmware.digest.byteLength;
+             digestOffset += 18) {
+          const digestLength = Math.min(
+            18,
+            selectedFirmware.digest.byteLength - digestOffset
+          );
+          const digestPacket = new Uint8Array(2 + digestLength);
+          digestPacket[0] = OTA_CONTROL_DIGEST;
+          digestPacket[1] = digestOffset;
+          digestPacket.set(
+            selectedFirmware.digest.subarray(
+              digestOffset,
+              digestOffset + digestLength
+            ),
+            2
+          );
+          await writeWithResponse(otaControlCharacteristic, digestPacket);
+        }
+        const startStatus = await waitForOtaState([OTA_STATE_RECEIVING], 5000);
+        showFirmwareStatus(
+          "UPLOADING",
+          `${selectedFirmware.name} · target slot ${startStatus.targetPartition}`,
+          true
+        );
+
+        let offset = 0;
+        let chunkSizeIndex = 0;
+        let retryCount = 0;
+        let nextProgressRead = 8192;
+        while (offset < selectedFirmware.stream.byteLength) {
+          if (otaCancelRequested) throw new Error("Firmware update aborted");
+
+          try {
+            const sent = await sendOtaChunk(
+              selectedFirmware.stream,
+              offset,
+              OTA_DATA_CHUNK_SIZES[chunkSizeIndex]
+            );
+            offset += sent;
+            retryCount = 0;
+          } catch (error) {
+            if (error.otaFatal || !device?.gatt?.connected) throw error;
+            if (chunkSizeIndex < OTA_DATA_CHUNK_SIZES.length - 1) {
+              ++chunkSizeIndex;
+              showFirmwareProgress(
+                offset,
+                selectedFirmware.stream.byteLength,
+                `Bluetooth selected ${OTA_DATA_CHUNK_SIZES[chunkSizeIndex]}-byte chunks; continuing…`
+              );
+              continue;
+            }
+            if (++retryCount > 4) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 120));
+            continue;
+          }
+
+          if (offset >= nextProgressRead || offset === selectedFirmware.stream.byteLength) {
+            const status = await readOtaStatus();
+            if (status.state === OTA_STATE_ERROR) throw otaStatusError(status);
+            const percent = Math.floor((offset / selectedFirmware.stream.byteLength) * 100);
+            showFirmwareProgress(
+              offset,
+              selectedFirmware.stream.byteLength,
+              `${percent}% sent · ${formatBytes(status.received)} written safely to the inactive slot`
+            );
+            nextProgressRead = offset + 8192;
+          }
+        }
+
+        showFirmwareStatus("VERIFYING", selectedFirmware.name, true);
+        showFirmwareProgress(
+          selectedFirmware.stream.byteLength,
+          selectedFirmware.stream.byteLength,
+          "Upload complete. RickBot is checking the full SHA-256 hash…"
+        );
+        await waitForOtaState([OTA_STATE_READY], 60000);
+
+        showFirmwareStatus("REBOOTING", "Verified successfully · switching firmware slots", true);
+        showFirmwareProgress(
+          selectedFirmware.stream.byteLength,
+          selectedFirmware.stream.byteLength,
+          "Verified. RickBot is rebooting into the new firmware…"
+        );
+        otaCommitSent = true;
+        await writeWithResponse(
+          otaControlCharacteristic,
+          Uint8Array.of(OTA_CONTROL_COMMIT)
+        );
+        setMessage("Firmware verified. RickBot will disconnect, reboot, and advertise again.");
+      } catch (error) {
+        if (!otaCancelRequested) {
+          showFirmwareStatus("FAILED", error.message || error.name);
+          showFirmwareProgress(
+            firmwareProgress.value,
+            firmwareProgress.max,
+            "The current firmware remains bootable. Reconnect and retry the update."
+          );
+          setMessage(`${error.message || error.name}. The previous firmware is still safe.`, true);
+        }
+      } finally {
+        otaUpdating = false;
+        if (!otaCommitSent) {
+          busy = false;
+          if (isConnected()) startImuPolling();
+        }
+        updateButtons();
+      }
+    }
+
+    async function abortFirmwareUpdate() {
+      if (!otaUpdating || !isConnected()) return;
+      otaCancelRequested = true;
+      abortFirmware.disabled = true;
+      showFirmwareStatus("ABORTING", "Stopping after the current Bluetooth operation");
+      try {
+        await writeWithResponse(
+          otaControlCharacteristic,
+          Uint8Array.of(OTA_CONTROL_ABORT)
+        );
+      } catch (error) {
+        // A disconnect also aborts a receive session in firmware.
+      }
+      otaUpdating = false;
+      busy = false;
+      showFirmwareStatus("ABORTED", "The inactive slot was discarded; current firmware is unchanged.");
+      showFirmwareProgress(0, 1, "Update aborted safely.");
+      setMessage("Firmware update aborted. Normal controls are available again.");
+      if (isConnected()) startImuPolling();
+      updateButtons();
+    }
+
     async function connect() {
       if (!bluetoothSupported) {
         setMessage(
@@ -850,6 +1332,21 @@
         controlCharacteristic = await service.getCharacteristic(CONTROL_UUID);
         imuCharacteristic = await service.getCharacteristic(IMU_UUID);
         servoCharacteristic = await service.getCharacteristic(SERVO_UUID);
+        try {
+          [
+            otaControlCharacteristic,
+            otaDataCharacteristic,
+            otaStatusCharacteristic
+          ] = await Promise.all([
+            service.getCharacteristic(OTA_CONTROL_UUID),
+            service.getCharacteristic(OTA_DATA_UUID),
+            service.getCharacteristic(OTA_STATUS_UUID)
+          ]);
+        } catch (error) {
+          otaControlCharacteristic = null;
+          otaDataCharacteristic = null;
+          otaStatusCharacteristic = null;
+        }
 
         showConnection("Initializing…", "Reading RickBot state", "working");
         setMessage("Bluetooth connected. Preparing control and calibration…");
@@ -863,7 +1360,27 @@
           await readRobotState();
           await readServoCenters();
           await readImuTelemetry();
-          setMessage("Bluetooth connected. Control and calibration are ready.");
+          if (otaIsAvailable()) {
+            const otaStatus = await readOtaStatus();
+            if (otaStatus.state === OTA_STATE_READY) {
+              showFirmwareStatus(
+                "READY TO BOOT",
+                "A verified update is waiting in the inactive slot. Select and upload the UF2 again if you did not initiate it."
+              );
+            } else {
+              showFirmwareStatus(
+                "CONNECTED",
+                "Choose rick_v2_pico.uf2 to prepare a wireless update."
+              );
+            }
+            setMessage("Bluetooth connected. Control, calibration, and wireless updates are ready.");
+          } else {
+            showFirmwareStatus(
+              "WIRED SETUP",
+              "This firmware predates wireless updates. Flash the new UF2 over USB once."
+            );
+            setMessage("Bluetooth connected. A one-time wired flash is required to enable wireless updates.");
+          }
         } catch (error) {
           // Initial reads are informational. Robot-changing writes remain
           // available and request encrypted pairing on first use.
@@ -874,6 +1391,9 @@
         controlCharacteristic = null;
         imuCharacteristic = null;
         servoCharacteristic = null;
+        otaControlCharacteristic = null;
+        otaDataCharacteristic = null;
+        otaStatusCharacteristic = null;
         if (device?.gatt?.connected) device.gatt.disconnect();
 
         if (error.name === "NotFoundError") {
@@ -891,12 +1411,20 @@
     }
 
     function handleDisconnect() {
+      const expectedFirmwareReboot = otaCommitSent;
+      const interruptedFirmwareUpdate = otaUpdating && !otaCommitSent;
       stopImuPolling();
       gattOperationQueue = Promise.resolve();
       controlCharacteristic = null;
       imuCharacteristic = null;
       servoCharacteristic = null;
+      otaControlCharacteristic = null;
+      otaDataCharacteristic = null;
+      otaStatusCharacteristic = null;
       busy = false;
+      otaUpdating = false;
+      otaCancelRequested = false;
+      otaCommitSent = false;
       lastImuReadAt = 0;
       accelerometer = [0, 0, 0];
       [0, 1, 2].forEach((index) => {
@@ -908,8 +1436,20 @@
       centeredServos.clear();
       servoCenters = Array(servoNames.length).fill(null);
       renderServoState();
-      showConnection("Disconnected", "Robot policy stopped automatically", "");
-      setMessage("Connection lost. The firmware is holding the robot's last pose.", true);
+      if (expectedFirmwareReboot) {
+        showConnection("Rebooting", "New firmware verified · reconnect in a few seconds", "working");
+        showFirmwareStatus("INSTALLED", "RickBot is rebooting into the verified firmware.", true);
+        showFirmwareProgress(1, 1, "Update installed. Reconnect when RickBot appears again.");
+        setMessage("Firmware installed successfully. Reconnect after RickBot restarts.");
+      } else if (interruptedFirmwareUpdate) {
+        showConnection("Disconnected", "Update interrupted · current firmware remains safe", "");
+        showFirmwareStatus("INTERRUPTED", "Reconnect and select the UF2 to retry.");
+        showFirmwareProgress(0, 1, "The inactive slot was not activated.");
+        setMessage("Bluetooth disconnected during the update. The current firmware is unchanged.", true);
+      } else {
+        showConnection("Disconnected", "Robot policy stopped automatically", "");
+        setMessage("Connection lost. The firmware is holding the robot's last pose.", true);
+      }
       updateButtons();
     }
 
@@ -1091,6 +1631,9 @@
 
     finishCalibration.addEventListener("click", finishServoCalibration);
     copyCenters.addEventListener("click", copyServoCenters);
+    firmwareFileInput.addEventListener("change", chooseFirmware);
+    installFirmware.addEventListener("click", installSelectedFirmware);
+    abortFirmware.addEventListener("click", abortFirmwareUpdate);
 
     window.addEventListener("beforeinstallprompt", (event) => {
       event.preventDefault();

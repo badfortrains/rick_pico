@@ -40,7 +40,7 @@
 // Bonding keys are persisted by pico_btstack_cyw43's flash-backed TLV store.
 #define NVM_NUM_DEVICE_DB_ENTRIES 16
 #define NVM_NUM_LINK_KEYS 16
-#define MAX_ATT_DB_SIZE 512
+#define MAX_ATT_DB_SIZE 768
 
 #define HAVE_EMBEDDED_TIME_MS
 #define HAVE_ASSERT

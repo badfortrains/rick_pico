@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "rick-control-v1";
+const CACHE_NAME = "rick-control-v2";
 const APP_SHELL = [
   "./bluetooth.html",
   "./manifest.webmanifest",

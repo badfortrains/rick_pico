@@ -113,6 +113,46 @@ when it appears, or choose **Add to Home screen** from Chrome's menu. The app
 shell is cached so the controller can open without an internet connection;
 Bluetooth still needs to be enabled on the phone.
 
+## Wireless firmware updates
+
+The Pico 2 W firmware and Rick Control page support encrypted BLE firmware
+updates. The RP2350 flash is split into two 2040 KiB application slots. An
+update is always written to the inactive slot, so disconnecting Bluetooth or
+losing power during an upload leaves the currently running firmware intact.
+The final 16 KiB of flash are kept outside both slots for BTstack's bond store
+and the RP2350-E10 reserved sector.
+
+The build is hashed and marked **Try Before You Buy**. After an update, the
+RP2350 boot ROM starts the new slot under its rollback watchdog. The firmware
+accepts the new slot only after the robot hardware and Bluetooth stack have
+initialized; otherwise the boot ROM returns to the previous slot.
+
+### One-time wired setup
+
+Build the project, put the Pico 2 W into BOOTSEL mode, and copy
+`build/rick_v2_pico.uf2` to it once. The A/B partition table is embedded in
+that UF2, so there is no separate partition file to install. Keep the robot
+supported and keep servo power safely isolated during this first boot.
+
+### Later updates over Bluetooth
+
+1. Rebuild the project to create a new `build/rick_v2_pico.uf2`.
+2. Open the HTTPS-hosted Rick Control page in Chrome on Android and connect to
+   RickBot.
+3. In **Firmware update**, choose `rick_v2_pico.uf2` and tap **Install
+   firmware**.
+4. Keep the Pico powered while the page uploads and verifies the image. RickBot
+   disconnects when it reboots into the verified slot; reconnect after a few
+   seconds.
+
+The page accepts only complete RP2350 RISC-V Rick firmware UF2s, hashes the
+transfer before it starts, and shows both upload and device-written progress.
+The firmware independently validates every UF2 block, its target range and
+order, and the full SHA-256 digest before enabling the reboot. The update GATT
+characteristics require the same encrypted BLE connection as robot-changing
+commands. USB BOOTSEL remains the recovery path if both firmware slots are ever
+damaged.
+
 ## Build
 
 The project now targets `pico2_w` in `CMakeLists.txt` and uses the Pico SDK
