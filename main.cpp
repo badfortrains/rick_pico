@@ -58,8 +58,8 @@ const float SERVO_DIRS[ACTION_DIM] = {
 
 // Existing lower-leg calibration values are retained at their shifted indices.
 float SERVO_CENTERS_US[ACTION_DIM] = {
-    1595.0f, 1570.0f, 1425.0f, 1500.0f,
-    1445.0f, 1520.0f, 1570.0f, 1570.0f,
+    1585.0f, 1555.0f, 1420.0f, 1500.0f,
+    1445.0f, 1500.0f, 1600.0f, 1570.0f,
 };
 
 // A conventional 500--2500 us servo spans approximately pi radians. The
