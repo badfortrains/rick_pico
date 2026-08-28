@@ -79,8 +79,25 @@ Copy `bluetooth.html` to the Android device and open it in Chrome, then:
      PPO policy at 50 Hz.
    - **Stop** stops policy inference and holds the last commanded servo pose.
 
+The same page includes two calibration tools:
+
+- **IMU axis check** shows live accelerometer and gyroscope readings in the
+  physical sensor frame. To verify a direction, point the named positive axis
+  straight up, hold the robot still, and tap its check button. A passing axis
+  reads about `+1 g` with the other two axes near zero. Complete all three to
+  confirm `+X` right, `+Y` down, and `+Z` forward.
+- **Servo centers** adjusts any of the eight neutral pulse widths in 1, 5, or
+  10 us steps. The first adjustment stops the policy and commands every joint
+  to its center. Mark each joint after mechanically centering it, then tap
+  **Finish & print values**. The page displays a complete
+  `SERVO_CENTERS_US` declaration and the firmware prints the same declaration
+  over USB serial.
+
+Servo calibration changes live RAM only. Copy the generated declaration into
+`main.cpp` and rebuild/flash the firmware to preserve it across a reboot.
+
 Disconnecting Bluetooth also stops the policy and holds the last pose. Always
-test with the robot supported off the ground first.
+test and calibrate with the robot supported off the ground first.
 
 Web Bluetooth is supported by Chrome on Android and is restricted to secure
 contexts. The controller is a completely self-contained file; if Chrome does

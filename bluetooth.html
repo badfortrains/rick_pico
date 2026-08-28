@@ -39,7 +39,7 @@
     }
 
     main {
-      width: min(100%, 520px);
+      width: min(100%, 680px);
       margin: 0 auto;
     }
 
@@ -236,6 +236,184 @@
 
     .message.error { color: #ff9292; }
 
+    .tool-card {
+      margin-top: 16px;
+      padding: 20px;
+      overflow: visible;
+    }
+
+    .tool-heading {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 17px;
+    }
+
+    .tool-heading h2 {
+      margin: 0;
+      font-size: 1.18rem;
+      letter-spacing: -0.025em;
+    }
+
+    .tool-heading p,
+    .tool-note {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.45;
+    }
+
+    .tool-status {
+      flex: 0 0 auto;
+      color: var(--orange);
+      font: 700 0.72rem/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-align: right;
+    }
+
+    .sensor-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+
+    .sensor-value {
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: #171715;
+    }
+
+    .sensor-value span {
+      display: block;
+      color: var(--muted);
+      font: 650 0.68rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-transform: uppercase;
+    }
+
+    .sensor-value output {
+      display: block;
+      margin-top: 7px;
+      font: 720 1rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .axis-checks,
+    .calibration-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .small-button,
+    .nudge-button,
+    .mark-button {
+      min-height: 40px;
+      padding: 0 13px;
+      border: 1px solid #535049;
+      border-radius: 10px;
+      background: #24231f;
+      font-size: 0.78rem;
+      font-weight: 720;
+    }
+
+    .small-button.primary {
+      background: var(--paper);
+      color: var(--ink);
+    }
+
+    .small-button.pass,
+    .mark-button.pass {
+      border-color: rgba(85, 209, 135, 0.65);
+      color: var(--green);
+    }
+
+    .small-button.fail { color: var(--red); }
+
+    .step-control {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0 0 13px;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    select {
+      min-height: 38px;
+      padding: 0 30px 0 11px;
+      border: 1px solid #535049;
+      border-radius: 9px;
+      background: #171715;
+      color: var(--paper);
+      font: inherit;
+    }
+
+    .servo-list {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+
+    .servo-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 12px;
+      padding: 12px;
+      background: #171715;
+    }
+
+    .servo-row + .servo-row { border-top: 1px solid var(--line); }
+    .servo-row.confirmed { background: rgba(85, 209, 135, 0.055); }
+
+    .servo-name {
+      display: block;
+      font-size: 0.83rem;
+      font-weight: 700;
+    }
+
+    .servo-meta {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font: 600 0.67rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .servo-nudge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .servo-center {
+      width: 68px;
+      text-align: center;
+      font: 720 0.82rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .nudge-button {
+      width: 40px;
+      padding: 0;
+      font-size: 1.1rem;
+    }
+
+    .mark-button { min-width: 78px; }
+
+    .code-output {
+      margin: 14px 0 0;
+      padding: 14px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #10100f;
+      color: #cbd8ff;
+      font: 0.72rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre;
+    }
+
+    .hidden { display: none; }
+
     .safety {
       margin: 17px 2px 0;
       display: flex;
@@ -261,6 +439,13 @@
     @media (max-width: 360px) {
       .controls { grid-template-columns: 1fr; }
       .command { min-height: 116px; }
+    }
+
+    @media (max-width: 560px) {
+      .servo-row {
+        grid-template-columns: minmax(0, 1fr) auto;
+      }
+      .mark-button { grid-column: 1 / -1; }
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -329,7 +514,62 @@
       <p class="message" id="message" role="status" aria-live="polite">Controls are locked until Bluetooth is connected.</p>
     </section>
 
-    <p class="safety">Support the robot off the ground during first use. Keep people and cables clear before pressing Start. A Bluetooth disconnect stops the policy and holds the last pose.</p>
+    <section class="card tool-card" aria-labelledby="imuHeading">
+      <div class="tool-heading">
+        <div>
+          <h2 id="imuHeading">IMU axis check</h2>
+          <p>Live physical sensor axes: +X right, +Y down, +Z forward.</p>
+        </div>
+        <span class="tool-status" id="imuStatus">WAITING</span>
+      </div>
+
+      <div class="sensor-grid" aria-label="Accelerometer in g">
+        <div class="sensor-value"><span>+X right</span><output id="accel0">— g</output></div>
+        <div class="sensor-value"><span>+Y down</span><output id="accel1">— g</output></div>
+        <div class="sensor-value"><span>+Z forward</span><output id="accel2">— g</output></div>
+        <div class="sensor-value"><span>gyro X</span><output id="gyro0">— °/s</output></div>
+        <div class="sensor-value"><span>gyro Y</span><output id="gyro1">— °/s</output></div>
+        <div class="sensor-value"><span>gyro Z</span><output id="gyro2">— °/s</output></div>
+      </div>
+
+      <p class="tool-note">To verify an axis, point that named positive direction straight up, hold the robot still, then tap its check. It should read about +1 g while the other two axes are near zero.</p>
+      <div class="axis-checks">
+        <button class="small-button" data-axis-check="0" data-requires-connection type="button" disabled>Check +X right</button>
+        <button class="small-button" data-axis-check="1" data-requires-connection type="button" disabled>Check +Y down</button>
+        <button class="small-button" data-axis-check="2" data-requires-connection type="button" disabled>Check +Z forward</button>
+      </div>
+      <p class="tool-note" id="imuResult" role="status">Connect to begin reading the IMU.</p>
+    </section>
+
+    <section class="card tool-card" aria-labelledby="servoHeading">
+      <div class="tool-heading">
+        <div>
+          <h2 id="servoHeading">Servo centers</h2>
+          <p>Nudging any servo stops the policy and moves every joint to its center.</p>
+        </div>
+        <span class="tool-status" id="servoProgress">0 / 8 SET</span>
+      </div>
+
+      <label class="step-control" for="stepSize">
+        Adjustment step
+        <select id="stepSize" data-requires-connection disabled>
+          <option value="1">1 µs</option>
+          <option value="5" selected>5 µs</option>
+          <option value="10">10 µs</option>
+        </select>
+      </label>
+
+      <div class="servo-list" id="servoList" aria-label="Servo center adjustments"></div>
+      <p class="tool-note">Adjust one joint at a time, then mark it centered. Finish is enabled after all eight joints are marked.</p>
+
+      <div class="calibration-actions">
+        <button class="small-button primary" id="finishCalibration" data-requires-connection type="button" disabled>Finish &amp; print values</button>
+        <button class="small-button hidden" id="copyCenters" type="button">Copy for main.cpp</button>
+      </div>
+      <pre class="code-output hidden" id="centerCode"></pre>
+    </section>
+
+    <p class="safety">Support the robot off the ground during calibration and first use. Keep people and cables clear before pressing Start. A Bluetooth disconnect stops the policy and holds the last pose.</p>
   </main>
 
   <script>
@@ -337,12 +577,22 @@
 
     const SERVICE_UUID = "7e57a001-4c91-4d8e-8f2a-7dca6d5a1000";
     const CONTROL_UUID = "7e57a002-4c91-4d8e-8f2a-7dca6d5a1000";
+    const IMU_UUID = "7e57a003-4c91-4d8e-8f2a-7dca6d5a1000";
+    const SERVO_UUID = "7e57a004-4c91-4d8e-8f2a-7dca6d5a1000";
+
+    const servoNames = [
+      "Left roll", "Left upper", "Left lower", "Left foot",
+      "Right roll", "Right upper", "Right lower", "Right foot"
+    ];
+    const servoPins = [12, 4, 3, 2, 13, 7, 5, 6];
+    const axisLabels = ["+X right", "+Y down", "+Z forward"];
 
     const stateLabels = [
       ["Default pose", "Policy stopped · calibrated centers"],
       ["Full action pose", "Policy stopped · all joints at +1.0"],
       ["Running", "PPO policy active at 50 Hz"],
-      ["Stopped", "Policy stopped · holding current pose"]
+      ["Stopped", "Policy stopped · holding current pose"],
+      ["Calibrating", "Policy stopped · servos at adjusted centers"]
     ];
 
     const commandMessages = [
@@ -358,14 +608,78 @@
     const statusDetail = document.getElementById("statusDetail");
     const message = document.getElementById("message");
     const commandButtons = [...document.querySelectorAll("[data-command]")];
+    const imuStatus = document.getElementById("imuStatus");
+    const imuResult = document.getElementById("imuResult");
+    const axisCheckButtons = [...document.querySelectorAll("[data-axis-check]")];
+    const servoList = document.getElementById("servoList");
+    const servoProgress = document.getElementById("servoProgress");
+    const stepSize = document.getElementById("stepSize");
+    const finishCalibration = document.getElementById("finishCalibration");
+    const copyCenters = document.getElementById("copyCenters");
+    const centerCode = document.getElementById("centerCode");
     const bluetoothSupported = "bluetooth" in navigator;
 
     let device = null;
     let controlCharacteristic = null;
+    let imuCharacteristic = null;
+    let servoCharacteristic = null;
     let busy = false;
+    let imuReadPending = false;
+    let imuPollTimer = null;
+    let lastImuReadAt = 0;
+    let accelerometer = [0, 0, 0];
+    let servoCenters = Array(servoNames.length).fill(null);
+    const verifiedAxes = new Set();
+    const centeredServos = new Set();
+
+    function renderServoRows() {
+      servoList.innerHTML = servoNames.map((name, index) => `
+        <div class="servo-row" data-servo-row="${index}">
+          <div>
+            <span class="servo-name">${index}. ${name}</span>
+            <span class="servo-meta">GPIO ${servoPins[index]}</span>
+          </div>
+          <div class="servo-nudge">
+            <button class="nudge-button" data-servo-delta="-1" data-servo="${index}" data-requires-connection type="button" aria-label="Decrease ${name} center" disabled>−</button>
+            <output class="servo-center" id="servoCenter${index}">— µs</output>
+            <button class="nudge-button" data-servo-delta="1" data-servo="${index}" data-requires-connection type="button" aria-label="Increase ${name} center" disabled>+</button>
+          </div>
+          <button class="mark-button" data-mark-servo="${index}" data-requires-connection type="button" disabled>Mark set</button>
+        </div>
+      `).join("");
+    }
+
+    function renderServoState() {
+      servoCenters.forEach((center, index) => {
+        document.getElementById(`servoCenter${index}`).textContent =
+          center === null ? "— µs" : `${center} µs`;
+        const row = document.querySelector(`[data-servo-row="${index}"]`);
+        const mark = document.querySelector(`[data-mark-servo="${index}"]`);
+        const confirmed = centeredServos.has(index);
+        row.classList.toggle("confirmed", confirmed);
+        mark.classList.toggle("pass", confirmed);
+        mark.textContent = confirmed ? "Centered ✓" : "Mark set";
+      });
+      servoProgress.textContent = `${centeredServos.size} / ${servoNames.length} SET`;
+    }
+
+    function resetAxisChecks() {
+      verifiedAxes.clear();
+      axisCheckButtons.forEach((button, index) => {
+        button.classList.remove("pass", "fail");
+        button.textContent = `Check ${axisLabels[index]}`;
+      });
+      imuStatus.textContent = "WAITING";
+    }
+
+    renderServoRows();
+    renderServoState();
 
     function isConnected() {
-      return Boolean(device?.gatt?.connected && controlCharacteristic);
+      return Boolean(
+        device?.gatt?.connected &&
+        controlCharacteristic && imuCharacteristic && servoCharacteristic
+      );
     }
 
     function setMessage(text, isError = false) {
@@ -376,6 +690,11 @@
     function updateButtons() {
       const locked = !isConnected() || busy;
       commandButtons.forEach((button) => { button.disabled = locked; });
+      document.querySelectorAll("[data-requires-connection]").forEach((control) => {
+        control.disabled = locked;
+      });
+      finishCalibration.disabled = locked || centeredServos.size !== servoNames.length;
+      copyCenters.disabled = busy;
       connectButton.disabled = busy || !bluetoothSupported;
       connectButton.textContent = isConnected() ? "Disconnect" : "Pair & connect";
     }
@@ -396,6 +715,62 @@
       const state = value.getUint8(0);
       showRobotState(state);
       return state;
+    }
+
+    async function readServoCenters() {
+      const value = await servoCharacteristic.readValue();
+      if (value.byteLength < servoNames.length * 2) {
+        throw new Error("Servo calibration response was incomplete");
+      }
+      servoCenters = servoNames.map((_, index) => value.getUint16(index * 2, true));
+      renderServoState();
+      return servoCenters;
+    }
+
+    async function readImuTelemetry() {
+      if (!imuCharacteristic || imuReadPending) return;
+      imuReadPending = true;
+      try {
+        const value = await imuCharacteristic.readValue();
+        if (value.byteLength < 12) throw new Error("IMU response was incomplete");
+
+        accelerometer = [0, 1, 2].map((index) => value.getInt16(index * 2, true) / 1000);
+        const gyroscope = [0, 1, 2].map((index) => value.getInt16(6 + index * 2, true) / 10);
+        accelerometer.forEach((reading, index) => {
+          document.getElementById(`accel${index}`).textContent = `${reading.toFixed(3)} g`;
+          document.getElementById(`gyro${index}`).textContent = `${gyroscope[index].toFixed(1)} °/s`;
+        });
+        lastImuReadAt = Date.now();
+        imuStatus.textContent = verifiedAxes.size > 0
+          ? `${verifiedAxes.size} / 3 PASS`
+          : "LIVE";
+      } catch (error) {
+        imuStatus.textContent = "READ ERROR";
+      } finally {
+        imuReadPending = false;
+      }
+    }
+
+    function stopImuPolling() {
+      if (imuPollTimer !== null) window.clearInterval(imuPollTimer);
+      imuPollTimer = null;
+      imuReadPending = false;
+    }
+
+    function startImuPolling() {
+      stopImuPolling();
+      readImuTelemetry();
+      imuPollTimer = window.setInterval(() => {
+        if (isConnected() && !busy) readImuTelemetry();
+      }, 250);
+    }
+
+    async function writeWithResponse(characteristic, payload) {
+      if (typeof characteristic.writeValueWithResponse === "function") {
+        await characteristic.writeValueWithResponse(payload);
+      } else {
+        await characteristic.writeValue(payload);
+      }
     }
 
     async function connect() {
@@ -423,12 +798,21 @@
         const server = await device.gatt.connect();
         const service = await server.getPrimaryService(SERVICE_UUID);
         controlCharacteristic = await service.getCharacteristic(CONTROL_UUID);
+        imuCharacteristic = await service.getCharacteristic(IMU_UUID);
+        servoCharacteristic = await service.getCharacteristic(SERVO_UUID);
 
         showConnection("Connected", device.name || "RickBot", "connected");
-        setMessage("Secure Bluetooth connected. Robot controls are ready.");
+        setMessage("Secure Bluetooth connected. Control and calibration are ready.");
+        centeredServos.clear();
+        resetAxisChecks();
+        centerCode.classList.add("hidden");
+        copyCenters.classList.add("hidden");
+        renderServoState();
 
         try {
           await readRobotState();
+          await readServoCenters();
+          await readImuTelemetry();
         } catch (error) {
           // A first-time bond can finish just after GATT discovery. Commands
           // remain available and will request encryption again if needed.
@@ -436,6 +820,8 @@
         }
       } catch (error) {
         controlCharacteristic = null;
+        imuCharacteristic = null;
+        servoCharacteristic = null;
         if (device?.gatt?.connected) device.gatt.disconnect();
 
         if (error.name === "NotFoundError") {
@@ -448,12 +834,27 @@
       } finally {
         busy = false;
         updateButtons();
+        if (isConnected()) startImuPolling();
       }
     }
 
     function handleDisconnect() {
+      stopImuPolling();
       controlCharacteristic = null;
+      imuCharacteristic = null;
+      servoCharacteristic = null;
       busy = false;
+      lastImuReadAt = 0;
+      accelerometer = [0, 0, 0];
+      [0, 1, 2].forEach((index) => {
+        document.getElementById(`accel${index}`).textContent = "— g";
+        document.getElementById(`gyro${index}`).textContent = "— °/s";
+      });
+      resetAxisChecks();
+      imuResult.textContent = "Connect to begin reading the IMU.";
+      centeredServos.clear();
+      servoCenters = Array(servoNames.length).fill(null);
+      renderServoState();
       showConnection("Disconnected", "Robot policy stopped automatically", "");
       setMessage("Connection lost. The firmware is holding the robot's last pose.", true);
       updateButtons();
@@ -473,11 +874,7 @@
 
       try {
         const payload = Uint8Array.of(command);
-        if (typeof controlCharacteristic.writeValueWithResponse === "function") {
-          await controlCharacteristic.writeValueWithResponse(payload);
-        } else {
-          await controlCharacteristic.writeValue(payload);
-        }
+        await writeWithResponse(controlCharacteristic, payload);
 
         // Firmware receives Bluetooth events in a background context and then
         // applies commands safely in the main control loop.
@@ -497,6 +894,85 @@
       }
     }
 
+    async function adjustServo(index, direction) {
+      if (!isConnected() || busy) return;
+
+      const delta = direction * Number(stepSize.value);
+      busy = true;
+      showConnection("Calibrating…", `${servoNames[index]} ${delta > 0 ? "+" : ""}${delta} µs`, "working");
+      setMessage("Policy stopped; applying servo center adjustment…");
+      updateButtons();
+
+      try {
+        const payload = new Uint8Array(3);
+        const view = new DataView(payload.buffer);
+        view.setUint8(0, index);
+        view.setInt16(1, delta, true);
+        await writeWithResponse(servoCharacteristic, payload);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        await readServoCenters();
+        centeredServos.delete(index);
+        renderServoState();
+        centerCode.classList.add("hidden");
+        copyCenters.classList.add("hidden");
+        showRobotState(4);
+        setMessage(`${servoNames[index]} center is now ${servoCenters[index]} µs.`);
+      } catch (error) {
+        setMessage(`${error.message || error.name}. Reconnect and try again.`, true);
+        if (!device?.gatt?.connected) handleDisconnect();
+      } finally {
+        busy = false;
+        updateButtons();
+      }
+    }
+
+    function formatServoCenters() {
+      const first = servoCenters.slice(0, 4).map((value) => `${value}.0f`).join(", ");
+      const second = servoCenters.slice(4).map((value) => `${value}.0f`).join(", ");
+      return `float SERVO_CENTERS_US[ACTION_DIM] = {\n    ${first},\n    ${second},\n};`;
+    }
+
+    async function finishServoCalibration() {
+      if (!isConnected() || busy || centeredServos.size !== servoNames.length) return;
+
+      busy = true;
+      showConnection("Finishing…", "Printing calibrated centers over USB serial", "working");
+      setMessage("Finalizing servo calibration…");
+      updateButtons();
+
+      try {
+        await writeWithResponse(servoCharacteristic, Uint8Array.of(0xff, 0, 0));
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        await readServoCenters();
+        centerCode.textContent = formatServoCenters();
+        centerCode.classList.remove("hidden");
+        copyCenters.classList.remove("hidden");
+        showRobotState(0);
+        setMessage("Calibration printed over USB serial and shown below for main.cpp.");
+      } catch (error) {
+        setMessage(`${error.message || error.name}. Reconnect and try again.`, true);
+        if (!device?.gatt?.connected) handleDisconnect();
+      } finally {
+        busy = false;
+        updateButtons();
+      }
+    }
+
+    async function copyServoCenters() {
+      const text = centerCode.textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (error) {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        textarea.remove();
+      }
+      setMessage("SERVO_CENTERS_US copied. Replace the declaration in main.cpp and rebuild.");
+    }
+
     connectButton.addEventListener("click", () => {
       if (isConnected()) {
         device.gatt.disconnect();
@@ -510,6 +986,58 @@
         sendCommand(Number(button.dataset.command));
       });
     });
+
+    axisCheckButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        const axis = Number(button.dataset.axisCheck);
+        if (!isConnected() || Date.now() - lastImuReadAt > 1000) {
+          imuResult.textContent = "Waiting for a fresh IMU reading. Try again in a moment.";
+          return;
+        }
+
+        const selected = accelerometer[axis];
+        const crossAxes = accelerometer.filter((_, index) => index !== axis);
+        const passed = selected >= 0.75 && selected <= 1.25 &&
+          crossAxes.every((value) => Math.abs(value) <= 0.35);
+
+        verifiedAxes[passed ? "add" : "delete"](axis);
+        button.classList.toggle("pass", passed);
+        button.classList.toggle("fail", !passed);
+        button.textContent = passed
+          ? `${axisLabels[axis]} ✓`
+          : `Retry ${axisLabels[axis]}`;
+        imuStatus.textContent = verifiedAxes.size === 3
+          ? "3 / 3 PASS"
+          : `${verifiedAxes.size} / 3 PASS`;
+        imuResult.textContent = passed
+          ? (verifiedAxes.size === 3
+            ? "All sensor axes match +X right, +Y down, +Z forward."
+            : `Axis passed at ${selected.toFixed(3)} g. Check the remaining axes.`)
+          : `Axis did not pass: selected ${selected.toFixed(3)} g, cross-axes ${crossAxes.map((value) => value.toFixed(3)).join(" / ")} g.`;
+      });
+    });
+
+    servoList.addEventListener("click", (event) => {
+      const nudge = event.target.closest("[data-servo-delta]");
+      if (nudge) {
+        adjustServo(Number(nudge.dataset.servo), Number(nudge.dataset.servoDelta));
+        return;
+      }
+
+      const mark = event.target.closest("[data-mark-servo]");
+      if (!mark || !isConnected() || busy) return;
+      const index = Number(mark.dataset.markServo);
+      if (centeredServos.has(index)) {
+        centeredServos.delete(index);
+      } else {
+        centeredServos.add(index);
+      }
+      renderServoState();
+      updateButtons();
+    });
+
+    finishCalibration.addEventListener("click", finishServoCalibration);
+    copyCenters.addEventListener("click", copyServoCenters);
 
     if (!bluetoothSupported) {
       setMessage(

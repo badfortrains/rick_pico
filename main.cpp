@@ -52,14 +52,14 @@ const uint SERVO_PINS[ACTION_DIM] = {12, 4, 3, 2, 13, 7, 5, 6};
 
 // Verify these signs and centers with the robot supported off the ground.
 const float SERVO_DIRS[ACTION_DIM] = {
-    -1.0f, -1.0f, -1.0f, -1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f,
     1.0f, 1.0f, 1.0f, 1.0f,
 };
 
 // Existing lower-leg calibration values are retained at their shifted indices.
 float SERVO_CENTERS_US[ACTION_DIM] = {
-    1500.0f, 1500.0f, 1500.0f, 1460.0f,
-    1500.0f, 1500.0f, 1500.0f, 1440.0f,
+    1595.0f, 1570.0f, 1425.0f, 1500.0f,
+    1445.0f, 1520.0f, 1570.0f, 1570.0f,
 };
 
 // A conventional 500--2500 us servo spans approximately pi radians. The
@@ -101,16 +101,31 @@ enum class ControlCommand : uint8_t {
     STOP = 3,
 };
 
+struct ServoCalibrationCommand {
+    uint8_t servo_index;
+    int16_t delta_us;
+};
+
+constexpr uint8_t SERVO_CALIBRATION_FINISH = 0xff;
+constexpr int16_t SERVO_CALIBRATION_MAX_STEP_US = 100;
+
 constexpr uint8_t CONTROL_STATE_DEFAULT = 0;
 constexpr uint8_t CONTROL_STATE_FULL_ACTION = 1;
 constexpr uint8_t CONTROL_STATE_RUNNING = 2;
 constexpr uint8_t CONTROL_STATE_STOPPED = 3;
+constexpr uint8_t CONTROL_STATE_CALIBRATING = 4;
 
 queue_t control_command_queue;
+queue_t servo_calibration_command_queue;
 volatile uint8_t control_state = CONTROL_STATE_DEFAULT;
 volatile bool stop_requested = false;
 bool robot_running = false;
+bool servo_calibration_active = false;
 hci_con_handle_t bluetooth_connection_handle = HCI_CON_HANDLE_INVALID;
+
+// Bluetooth telemetry uses signed milli-g for acceleration and signed
+// deci-degrees/second for angular velocity, all in the physical sensor frame.
+volatile int16_t imu_telemetry[6] = {0};
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 static btstack_packet_callback_registration_t sm_event_callback_registration;
@@ -295,6 +310,11 @@ void init_imu() {
     sleep_ms(50);
 }
 
+int16_t clamp_to_int16(float value) {
+    const float clamped = std::max(-32768.0f, std::min(32767.0f, value));
+    return static_cast<int16_t>(std::lround(clamped));
+}
+
 void read_imu(
     float *gx, float *gy, float *gz, float *ax, float *ay, float *az) {
     uint8_t reg = OUTX_L_G | 0x80;
@@ -318,6 +338,13 @@ void read_imu(
     const float physical_ax = raw_ax * ACCEL_SCALE_G;
     const float physical_ay = raw_ay * ACCEL_SCALE_G;
     const float physical_az = raw_az * ACCEL_SCALE_G;
+
+    imu_telemetry[0] = clamp_to_int16(physical_ax * 1000.0f);
+    imu_telemetry[1] = clamp_to_int16(physical_ay * 1000.0f);
+    imu_telemetry[2] = clamp_to_int16(physical_az * 1000.0f);
+    imu_telemetry[3] = clamp_to_int16(physical_gx * (1800.0f / PI_F));
+    imu_telemetry[4] = clamp_to_int16(physical_gy * (1800.0f / PI_F));
+    imu_telemetry[5] = clamp_to_int16(physical_gz * (1800.0f / PI_F));
 
     // Sensor: +X right, +Y down, +Z forward.
     // MuJoCo: +X right, +Y backward, +Z up.
@@ -389,7 +416,58 @@ void reset_servos(float action) {
     update_servos(target_actions);
 }
 
+void print_servo_centers() {
+    printf("\nCopy this calibration into main.cpp:\n");
+    printf("float SERVO_CENTERS_US[ACTION_DIM] = {\n");
+    for (int index = 0; index < ACTION_DIM; ++index) {
+        if (index % 4 == 0) {
+            printf("    ");
+        }
+        printf("%.1ff%s", SERVO_CENTERS_US[index],
+               index + 1 == ACTION_DIM ? "" : ", ");
+        if (index % 4 == 3 || index + 1 == ACTION_DIM) {
+            printf("\n");
+        }
+    }
+    printf("};\n\n");
+}
+
+void apply_servo_calibration_command(const ServoCalibrationCommand &command) {
+    if (command.servo_index == SERVO_CALIBRATION_FINISH) {
+        reset_servos(0.0f);
+        servo_calibration_active = false;
+        control_state = CONTROL_STATE_DEFAULT;
+        print_servo_centers();
+        return;
+    }
+
+    if (command.servo_index >= ACTION_DIM) {
+        return;
+    }
+
+    if (!servo_calibration_active) {
+        // Enter calibration at the neutral pose, never from a running or held
+        // policy pose. Subsequent nudges preserve all current center values.
+        reset_servos(0.0f);
+        servo_calibration_active = true;
+    }
+
+    SERVO_CENTERS_US[command.servo_index] = std::max(
+        SERVO_MIN_US,
+        std::min(
+            SERVO_MAX_US,
+            SERVO_CENTERS_US[command.servo_index] + command.delta_us));
+    update_servos(target_actions);
+    control_state = CONTROL_STATE_CALIBRATING;
+    printf(
+        "Servo %u center adjusted by %+d us to %.0f us.\n",
+        static_cast<unsigned>(command.servo_index),
+        static_cast<int>(command.delta_us),
+        SERVO_CENTERS_US[command.servo_index]);
+}
+
 void apply_control_command(ControlCommand command) {
+    servo_calibration_active = false;
     switch (command) {
         case ControlCommand::RESET_DEFAULT:
             reset_servos(0.0f);
@@ -433,6 +511,11 @@ void process_control_commands() {
         uint8_t discarded_command;
         while (queue_try_remove(&control_command_queue, &discarded_command)) {
         }
+        ServoCalibrationCommand discarded_calibration_command;
+        while (queue_try_remove(
+            &servo_calibration_command_queue,
+            &discarded_calibration_command)) {
+        }
         apply_control_command(ControlCommand::STOP);
         return;
     }
@@ -440,6 +523,13 @@ void process_control_commands() {
     uint8_t command_value;
     while (queue_try_remove(&control_command_queue, &command_value)) {
         apply_control_command(static_cast<ControlCommand>(command_value));
+    }
+}
+
+void process_servo_calibration_commands() {
+    ServoCalibrationCommand command;
+    while (queue_try_remove(&servo_calibration_command_queue, &command)) {
+        apply_servo_calibration_command(command);
     }
 }
 
@@ -487,14 +577,47 @@ uint16_t bluetooth_read_callback(
     uint16_t buffer_size) {
     UNUSED(connection_handle);
 
-    if (attribute_handle !=
+    if (attribute_handle ==
         ATT_CHARACTERISTIC_7E57A002_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        return 0;
+        const uint8_t state = control_state;
+        return att_read_callback_handle_blob(
+            &state, sizeof(state), offset, buffer, buffer_size);
     }
 
-    const uint8_t state = control_state;
-    return att_read_callback_handle_blob(
-        &state, sizeof(state), offset, buffer, buffer_size);
+    if (attribute_handle ==
+        ATT_CHARACTERISTIC_7E57A003_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        uint8_t telemetry_bytes[12];
+        for (int index = 0; index < 6; ++index) {
+            const uint16_t value = static_cast<uint16_t>(imu_telemetry[index]);
+            telemetry_bytes[index * 2] = value & 0xff;
+            telemetry_bytes[index * 2 + 1] = value >> 8;
+        }
+        return att_read_callback_handle_blob(
+            telemetry_bytes,
+            sizeof(telemetry_bytes),
+            offset,
+            buffer,
+            buffer_size);
+    }
+
+    if (attribute_handle ==
+        ATT_CHARACTERISTIC_7E57A004_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        uint8_t center_bytes[ACTION_DIM * 2];
+        for (int index = 0; index < ACTION_DIM; ++index) {
+            const uint16_t center =
+                static_cast<uint16_t>(std::lround(SERVO_CENTERS_US[index]));
+            center_bytes[index * 2] = center & 0xff;
+            center_bytes[index * 2 + 1] = center >> 8;
+        }
+        return att_read_callback_handle_blob(
+            center_bytes,
+            sizeof(center_bytes),
+            offset,
+            buffer,
+            buffer_size);
+    }
+
+    return 0;
 }
 
 int bluetooth_write_callback(
@@ -506,32 +629,63 @@ int bluetooth_write_callback(
     uint16_t buffer_size) {
     UNUSED(connection_handle);
 
-    if (attribute_handle !=
-        ATT_CHARACTERISTIC_7E57A002_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        return 0;
-    }
     if (transaction_mode != ATT_TRANSACTION_MODE_NONE) {
         return ATT_ERROR_REQUEST_NOT_SUPPORTED;
     }
     if (offset != 0) {
         return ATT_ERROR_INVALID_OFFSET;
     }
-    if (buffer_size != 1) {
-        return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
-    }
-    if (buffer[0] > static_cast<uint8_t>(ControlCommand::STOP)) {
-        return ATT_ERROR_REQUEST_NOT_SUPPORTED;
-    }
 
-    if (buffer[0] == static_cast<uint8_t>(ControlCommand::STOP)) {
-        // This flag is observed before the command queue so Stop cannot be
-        // delayed behind other commands.
-        stop_requested = true;
+    if (attribute_handle ==
+        ATT_CHARACTERISTIC_7E57A002_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        if (buffer_size != 1) {
+            return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        }
+        if (buffer[0] > static_cast<uint8_t>(ControlCommand::STOP)) {
+            return ATT_ERROR_REQUEST_NOT_SUPPORTED;
+        }
+
+        if (buffer[0] == static_cast<uint8_t>(ControlCommand::STOP)) {
+            // This flag is observed before the command queue so Stop cannot be
+            // delayed behind other commands.
+            stop_requested = true;
+            return 0;
+        }
+        if (!queue_try_add(&control_command_queue, buffer)) {
+            return ATT_ERROR_INSUFFICIENT_RESOURCES;
+        }
         return 0;
     }
-    if (!queue_try_add(&control_command_queue, buffer)) {
-        return ATT_ERROR_INSUFFICIENT_RESOURCES;
+
+    if (attribute_handle ==
+        ATT_CHARACTERISTIC_7E57A004_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
+        if (buffer_size != 3) {
+            return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        }
+
+        int32_t delta_us =
+            static_cast<int32_t>(buffer[1] | (buffer[2] << 8));
+        if ((delta_us & 0x8000) != 0) {
+            delta_us -= 0x10000;
+        }
+
+        const bool finish = buffer[0] == SERVO_CALIBRATION_FINISH;
+        if ((finish && delta_us != 0) ||
+            (!finish &&
+             (buffer[0] >= ACTION_DIM || delta_us == 0 ||
+              delta_us < -SERVO_CALIBRATION_MAX_STEP_US ||
+              delta_us > SERVO_CALIBRATION_MAX_STEP_US))) {
+            return ATT_ERROR_REQUEST_NOT_SUPPORTED;
+        }
+
+        const ServoCalibrationCommand command = {
+            buffer[0], static_cast<int16_t>(delta_us)};
+        if (!queue_try_add(&servo_calibration_command_queue, &command)) {
+            return ATT_ERROR_INSUFFICIENT_RESOURCES;
+        }
+        return 0;
     }
+
     return 0;
 }
 
@@ -650,6 +804,10 @@ int main() {
     init_imu();
     init_servos();
     queue_init(&control_command_queue, sizeof(uint8_t), 8);
+    queue_init(
+        &servo_calibration_command_queue,
+        sizeof(ServoCalibrationCommand),
+        8);
     reset_servos(0.0f);
     control_state = CONTROL_STATE_DEFAULT;
 
@@ -672,12 +830,13 @@ int main() {
 
     while (true) {
         process_control_commands();
+        process_servo_calibration_commands();
 
         if (run_control_step) {
             run_control_step = false;
+            read_imu(&gx, &gy, &gz, &ax, &ay, &az);
 
             if (robot_running) {
-                read_imu(&gx, &gy, &gz, &ax, &ay, &az);
                 madgwick_update_6dof(gx, gy, gz, ax, ay, az, POLICY_CONTROL_DT);
                 update_imu_and_clock_observation(gx, gy, gz);
 
