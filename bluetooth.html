@@ -735,7 +735,9 @@
       "The firmware does not fit the update partition",
       "Flash programming failed",
       "The completed upload did not match its SHA-256 hash",
-      "Bluetooth disconnected during the upload"
+      "Bluetooth disconnected during the upload",
+      "The RP2350 boot ROM rejected the programmed image",
+      "The RP2350 boot ROM could not start the update reboot"
     ];
 
     const servoNames = [
@@ -796,6 +798,7 @@
     let otaUpdating = false;
     let otaCancelRequested = false;
     let otaCommitSent = false;
+    let expectedBootPartition = null;
     let selectedFirmware = null;
     let imuReadPending = false;
     let imuPollTimer = null;
@@ -1005,13 +1008,20 @@
       if (value.getUint8(0) !== OTA_PROTOCOL_VERSION) {
         throw new Error("RickBot uses an incompatible update protocol");
       }
+      const extendedStatus = value.byteLength >= 28;
       return {
         state: value.getUint8(1),
         error: value.getUint8(2),
         targetPartition: value.getUint8(3),
         received: value.getUint32(4, true),
         total: value.getUint32(8, true),
-        blocks: value.getUint32(12, true)
+        blocks: value.getUint32(12, true),
+        bootPartition: extendedStatus ? value.getInt8(16) : null,
+        bootType: extendedStatus ? value.getUint8(17) : null,
+        buyPending: extendedStatus ? (value.getUint8(18) & 1) !== 0 : null,
+        confirmationAttempted: extendedStatus ? value.getUint8(19) !== 0 : null,
+        confirmationResult: extendedStatus ? value.getInt32(20, true) : null,
+        bootDiagnostic: extendedStatus ? value.getUint32(24, true) : null
       };
     }
 
@@ -1199,6 +1209,7 @@
           `${selectedFirmware.name} · target slot ${startStatus.targetPartition}`,
           true
         );
+        expectedBootPartition = startStatus.targetPartition;
 
         let offset = 0;
         let chunkSizeIndex = 0;
@@ -1364,7 +1375,46 @@
           await readImuTelemetry();
           if (otaIsAvailable()) {
             const otaStatus = await readOtaStatus();
-            if (otaStatus.state === OTA_STATE_READY) {
+            if (expectedBootPartition !== null &&
+                otaStatus.bootPartition !== null) {
+              if (otaStatus.bootPartition === expectedBootPartition &&
+                  otaStatus.buyPending === false) {
+                showFirmwareStatus(
+                  "INSTALLED",
+                  `Update confirmed in firmware slot ${otaStatus.bootPartition}.`,
+                  true
+                );
+                setMessage("Firmware update installed and confirmed by RickBot.");
+                expectedBootPartition = null;
+              } else if (otaStatus.bootPartition === expectedBootPartition) {
+                showFirmwareStatus(
+                  "CONFIRMING",
+                  `New firmware is running in trial slot ${otaStatus.bootPartition}.`,
+                  true
+                );
+                setMessage("RickBot is still confirming the trial boot. Reconnect once more in a moment.");
+              } else {
+                showFirmwareStatus(
+                  "ROLLED BACK",
+                  `Expected slot ${expectedBootPartition}, but RickBot booted slot ${otaStatus.bootPartition}.`
+                );
+                setMessage(
+                  "The RP2350 returned to the previous firmware. Check the boot diagnostic over USB serial.",
+                  true
+                );
+                expectedBootPartition = null;
+              }
+            } else if (expectedBootPartition !== null) {
+              showFirmwareStatus(
+                "NOT CONFIRMED",
+                "RickBot returned on firmware that cannot report its boot slot."
+              );
+              setMessage(
+                "The update rolled back on the older boot setup. Install ota_partition.uf2 once over USB, reboot, then install rick_v2_pico.uf2.",
+                true
+              );
+              expectedBootPartition = null;
+            } else if (otaStatus.state === OTA_STATE_READY) {
               showFirmwareStatus(
                 "READY TO BOOT",
                 "A verified update is waiting in the inactive slot. Select and upload the UF2 again if you did not initiate it."
@@ -1375,7 +1425,10 @@
                 "Choose rick_v2_pico.uf2 to prepare a wireless update."
               );
             }
-            setMessage("Bluetooth connected. Control, calibration, and wireless updates are ready.");
+            if (expectedBootPartition === null &&
+                firmwareStatus.textContent === "CONNECTED") {
+              setMessage("Bluetooth connected. Control, calibration, and wireless updates are ready.");
+            }
           } else {
             showFirmwareStatus(
               "WIRED SETUP",
@@ -1440,10 +1493,11 @@
       renderServoState();
       if (expectedFirmwareReboot) {
         showConnection("Rebooting", "New firmware verified · reconnect in a few seconds", "working");
-        showFirmwareStatus("INSTALLED", "RickBot is rebooting into the verified firmware.", true);
-        showFirmwareProgress(1, 1, "Update installed. Reconnect when RickBot appears again.");
-        setMessage("Firmware installed successfully. Reconnect after RickBot restarts.");
+        showFirmwareStatus("VERIFY ON RECONNECT", "RickBot is trying the new firmware slot.", true);
+        showFirmwareProgress(1, 1, "Reboot requested. Reconnect to confirm which slot is running.");
+        setMessage("Reconnect after RickBot restarts to confirm the update.");
       } else if (interruptedFirmwareUpdate) {
+        expectedBootPartition = null;
         showConnection("Disconnected", "Update interrupted · current firmware remains safe", "");
         showFirmwareStatus("INTERRUPTED", "Reconnect and select the UF2 to retry.");
         showFirmwareProgress(0, 1, "The inactive slot was not activated.");

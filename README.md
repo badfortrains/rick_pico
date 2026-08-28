@@ -116,11 +116,12 @@ Bluetooth still needs to be enabled on the phone.
 ## Wireless firmware updates
 
 The Pico 2 W firmware and Rick Control page support encrypted BLE firmware
-updates. The RP2350 flash is split into two 2040 KiB application slots. An
-update is always written to the inactive slot, so disconnecting Bluetooth or
-losing power during an upload leaves the currently running firmware intact.
-The final 16 KiB of flash are kept outside both slots for BTstack's bond store
-and the RP2350-E10 reserved sector.
+updates. The resident RP2350 partition table occupies the first 8 KiB of
+flash, followed by two 2036 KiB application slots. An update is always written
+to the inactive slot, so disconnecting Bluetooth or losing power during an
+upload leaves the currently running firmware intact. The final 16 KiB of flash
+are kept outside both slots for BTstack's bond store and the RP2350-E10
+reserved sector.
 
 The build is hashed and marked **Try Before You Buy**. After an update, the
 RP2350 boot ROM starts the new slot under its rollback watchdog. The firmware
@@ -129,10 +130,27 @@ initialized; otherwise the boot ROM returns to the previous slot.
 
 ### One-time wired setup
 
-Build the project, put the Pico 2 W into BOOTSEL mode, and copy
-`build/rick_v2_pico.uf2` to it once. The A/B partition table is embedded in
-that UF2, so there is no separate partition file to install. Keep the robot
-supported and keep servo power safely isolated during this first boot.
+The partition table and application are deliberately separate. This matches
+the RP2350 A/B update flow and keeps the later wireless-update UF2 free of
+partition-table metadata.
+
+For a Pico 2 W with empty/unpartitioned flash:
+
+1. Build the project, enter BOOTSEL mode, and copy
+   `build/ota_partition.uf2` to the Pico.
+2. Let it reboot, then create a one-time bootstrap build with
+   `-DRICK_BOOTSTRAP_IMAGE=ON`. Enter BOOTSEL a second time and load that
+   build's `rick_v2_pico.uf2` with Picotool's `-x` option. The bootstrap image
+   is not TBYB because neither slot contains a bought fallback yet.
+3. Build normally afterward. The regular `build/rick_v2_pico.uf2` remains
+   hashed and TBYB-enabled for all later Bluetooth updates.
+
+Installing `ota_partition.uf2` is a one-time operation. Do not send that file
+through Rick Control. The earlier experimental OTA-enabled build embedded the
+table in replaceable slot A; that is not equivalent to installing the resident
+table, so a Pico flashed with that build must also complete both wired steps
+above once. Keep the robot supported and keep servo power safely isolated
+during the first application boot.
 
 ### Later updates over Bluetooth
 
@@ -142,20 +160,22 @@ supported and keep servo power safely isolated during this first boot.
 3. In **Firmware update**, choose `rick_v2_pico.uf2` and tap **Install
    firmware**.
 4. Keep the Pico powered while the page uploads and verifies the image. RickBot
-   disconnects when it reboots into the verified slot; reconnect after a few
-   seconds.
+   disconnects when it reboots into the verified slot. Reconnect after a few
+   seconds; the page then reports whether the new slot was confirmed or the
+   boot ROM rolled back to the previous slot.
 
 The page accepts only complete RP2350 RISC-V Rick firmware UF2s, hashes the
 transfer before it starts, and shows both upload and device-written progress.
 The firmware independently validates every UF2 block, its target range and
-order, and the full SHA-256 digest before enabling the reboot. The update GATT
-characteristics require the same encrypted BLE connection as robot-changing
-commands. USB BOOTSEL remains the recovery path if both firmware slots are ever
-damaged.
+order, the full SHA-256 transfer digest, and the programmed slot with the
+RP2350 boot ROM before enabling the reboot. The update GATT characteristics
+require the same encrypted BLE connection as robot-changing commands. USB
+BOOTSEL remains the recovery path if both firmware slots are ever damaged.
 
 ## Build
 
-The project now targets `pico2_w` in `CMakeLists.txt` and uses the Pico SDK
-BTstack/CYW43 libraries. Build and flash it through the Raspberry Pi Pico VS
-Code extension as before. Ensure the SDK's `btstack` and `cyw43-driver`
-submodules are installed; the Pico extension normally manages these.
+The project targets `pico2_w` in `CMakeLists.txt` and requires Pico SDK 2.3.0
+and Picotool 2.3.0 for the RP2350 A/B update flow. Build and flash it through
+the Raspberry Pi Pico VS Code extension as before. Ensure the SDK's `btstack`
+and `cyw43-driver` submodules are installed; the Pico extension normally
+manages these.

@@ -12,8 +12,7 @@
     {
       "name": "Rick firmware A",
       "id": 0,
-      "start": 0,
-      "size": "2040K",
+      "size": "2036K",
       "families": ["rp2350-arm-s", "rp2350-riscv"],
       "permissions": {
         "secure": "rw",
@@ -24,7 +23,7 @@
     {
       "name": "Rick firmware B",
       "id": 0,
-      "size": "2040K",
+      "size": "2036K",
       "families": ["rp2350-arm-s", "rp2350-riscv"],
       "permissions": {
         "secure": "rw",

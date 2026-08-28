@@ -4,9 +4,9 @@ if(WIN32)
 else()
     set(USERHOME $ENV{HOME})
 endif()
-set(sdkVersion 2.2.0)
+set(sdkVersion 2.3.0)
 set(toolchainVersion RISCV_ZCB_RPI_2_2_0_2)
-set(picotoolVersion 2.2.0-a4)
+set(picotoolVersion 2.3.0)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
@@ -18,6 +18,12 @@ cmake_minimum_required(VERSION 3.13)
 include(pico_sdk_import.cmake)
 
 project(rick_v2_pico C CXX ASM)
+
+option(
+    RICK_BOOTSTRAP_IMAGE
+    "Build the first application without TBYB when both A/B slots are empty"
+    OFF
+)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
@@ -59,21 +65,38 @@ pico_btstack_make_gatt_header(
     "${CMAKE_CURRENT_LIST_DIR}/rick_control.gatt"
 )
 
-# Embed the RP2350 A/B layout in the initial wired image. Each application
-# partition is 2040 KiB. The final 16 KiB remain unpartitioned so BTstack's
-# two-sector bond store and the RP2350-E10 reserved sector stay untouched.
-pico_embed_pt_in_binary(
-    rick_v2_pico
-    "${CMAKE_CURRENT_LIST_DIR}/ota_partition.json"
-)
+# Keep the partition table out of the replaceable application image. The
+# RP2350 must install it separately, reboot to activate it, and only then load
+# an application into one of the A/B slots. Generate that one-time wired UF2.
+pico_init_picotool()
+if (picotool_FOUND)
+    set(OTA_PARTITION_UF2 "${CMAKE_CURRENT_BINARY_DIR}/ota_partition.uf2")
+    add_custom_command(
+        OUTPUT "${OTA_PARTITION_UF2}"
+        COMMAND picotool partition create --quiet
+            "${CMAKE_CURRENT_LIST_DIR}/ota_partition.json"
+            "${OTA_PARTITION_UF2}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/ota_partition.json"
+        VERBATIM
+    )
+    add_custom_target(rick_v2_pico_partition ALL
+        DEPENDS "${OTA_PARTITION_UF2}"
+    )
+endif()
 
 # Hash every image so the RP2350 boot ROM verifies it before launch. TBYB
 # keeps the previous partition bootable until the new firmware initializes
 # its hardware and Bluetooth stack and explicitly accepts the update.
-target_compile_definitions(rick_v2_pico PRIVATE
-    PICO_CRT0_IMAGE_TYPE_TBYB=1
-)
+if (RICK_BOOTSTRAP_IMAGE)
+    target_compile_definitions(rick_v2_pico PRIVATE
+        PICO_CRT0_IMAGE_TYPE_TBYB=0
+    )
+else()
+    target_compile_definitions(rick_v2_pico PRIVATE
+        PICO_CRT0_IMAGE_TYPE_TBYB=1
+    )
+endif()
 pico_hash_binary(rick_v2_pico)
 
-# Create the .uf2 file for the initial wired flash and later BLE updates.
+# Create the application-only .uf2 used for wired and later BLE updates.
 pico_add_extra_outputs(rick_v2_pico)

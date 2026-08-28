@@ -145,6 +145,7 @@ constexpr size_t OTA_MAX_DATA_VALUE_SIZE = 244;
 constexpr size_t OTA_WORKAREA_SIZE = 4096;
 constexpr uint32_t OTA_FLASH_SECTOR_SIZE = 4096;
 constexpr uint32_t OTA_FLASH_PAGE_SIZE = 256;
+constexpr uint8_t OTA_APPLICATION_PARTITION_A = 0;
 
 enum class OtaState : uint8_t {
     IDLE = 0,
@@ -166,6 +167,8 @@ enum class OtaError : uint8_t {
     FLASH_OPERATION = 7,
     HASH_MISMATCH = 8,
     DISCONNECTED = 9,
+    IMAGE_REJECTED = 10,
+    REBOOT_FAILED = 11,
 };
 
 struct OtaControlPacket {
@@ -186,6 +189,11 @@ volatile bool ota_abort_requested = false;
 volatile bool bluetooth_ready = false;
 bool pending_update_confirmation = false;
 bool update_confirmation_attempted = false;
+int8_t current_boot_partition = -1;
+uint8_t current_boot_type = 0xff;
+uint8_t current_tbyb_and_update_info = 0;
+int32_t update_confirmation_result = INT32_MIN;
+uint32_t current_boot_diagnostic = 0;
 bool ota_sha_active = false;
 uint8_t ota_expected_sha256[OTA_SHA256_SIZE] = {0};
 uint32_t ota_digest_bytes_received = 0;
@@ -735,8 +743,25 @@ void initialize_bootrom_support() {
     }
 #endif
 
+    boot_info_t boot_info = {};
+    if (rom_get_boot_info(&boot_info)) {
+        current_boot_partition = boot_info.partition;
+        current_boot_type =
+            static_cast<uint8_t>(rom_get_last_boot_type());
+        current_tbyb_and_update_info = boot_info.tbyb_and_update_info;
+        current_boot_diagnostic = boot_info.boot_diagnostic;
+    }
+
     pending_update_confirmation =
-        rom_get_last_boot_type() == BOOT_TYPE_FLASH_UPDATE;
+        current_boot_type == BOOT_TYPE_FLASH_UPDATE &&
+        (current_tbyb_and_update_info &
+         BOOT_TBYB_AND_UPDATE_FLAG_BUY_PENDING) != 0;
+    printf(
+        "Booted from partition %d (type %u, update info 0x%02x, diagnostic 0x%08lx).\n",
+        current_boot_partition,
+        current_boot_type,
+        current_tbyb_and_update_info,
+        static_cast<unsigned long>(current_boot_diagnostic));
     if (pending_update_confirmation) {
         printf("Firmware is running in the try-before-you-buy window.\n");
     }
@@ -750,8 +775,14 @@ void confirm_pending_update_if_ready() {
 
     update_confirmation_attempted = true;
     const int result = rom_explicit_buy(ota_workarea, sizeof(ota_workarea));
+    update_confirmation_result = result;
     if (result == BOOTROM_OK) {
         pending_update_confirmation = false;
+        boot_info_t boot_info = {};
+        if (rom_get_boot_info(&boot_info)) {
+            current_tbyb_and_update_info = boot_info.tbyb_and_update_info;
+            current_boot_diagnostic = boot_info.boot_diagnostic;
+        }
         printf("Firmware update accepted; this partition is now permanent.\n");
     } else {
         // Do not disable the TBYB watchdog. A failed confirmation must fall
@@ -948,8 +979,27 @@ void finish_ota_receive() {
         return;
     }
 
+    // The transfer hash above proves that BLE delivered the selected UF2.
+    // Ask the boot ROM to parse and verify the programmed image too, so READY
+    // means this exact A/B slot is bootable rather than merely byte-complete.
+    rom_flash_flush_cache();
+    const int picked_partition = rom_pick_ab_partition(
+        ota_workarea,
+        sizeof(ota_workarea),
+        OTA_APPLICATION_PARTITION_A,
+        ota_target_storage_base);
+    if (picked_partition < 0 ||
+        static_cast<uint32_t>(picked_partition) != ota_target_partition) {
+        printf(
+            "Boot ROM rejected update partition %lu (selection result %d).\n",
+            static_cast<unsigned long>(ota_target_partition),
+            picked_partition);
+        ota_fail(OtaError::IMAGE_REJECTED);
+        return;
+    }
+
     ota_state = OtaState::READY;
-    printf("Firmware image verified and ready to boot.\n");
+    printf("Firmware image verified by SHA-256 and the boot ROM; ready to boot.\n");
 }
 
 void process_ota_data_packet(const OtaDataPacket &packet) {
@@ -1013,19 +1063,24 @@ void process_ota_control_packets() {
                 printf("Firmware update aborted.\n");
                 break;
 
-            case OTA_CONTROL_COMMIT:
+            case OTA_CONTROL_COMMIT: {
                 if (packet.length != 1 || ota_state != OtaState::READY) {
                     ota_fail(OtaError::INVALID_REQUEST);
                     break;
                 }
                 ota_state = OtaState::REBOOTING;
                 printf("Rebooting into the verified firmware image.\n");
-                rom_reboot(
-                    REBOOT2_FLAG_REBOOT_TYPE_FLASH_UPDATE,
+                const int reboot_result = rom_reboot(
+                    REBOOT2_FLAG_REBOOT_TYPE_FLASH_UPDATE |
+                        REBOOT2_FLAG_NO_RETURN_ON_SUCCESS,
                     1000,
                     ota_target_storage_base,
                     0);
+                // NO_RETURN_ON_SUCCESS means reaching here is always failure.
+                printf("Boot ROM refused the firmware reboot (%d).\n", reboot_result);
+                ota_fail(OtaError::REBOOT_FAILED);
                 break;
+            }
 
             case OTA_CONTROL_DIGEST:
                 receive_ota_digest(packet);
@@ -1114,7 +1169,7 @@ uint16_t bluetooth_read_callback(
 
     if (attribute_handle ==
         ATT_CHARACTERISTIC_7E57A007_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        uint8_t status_bytes[16] = {
+        uint8_t status_bytes[28] = {
             OTA_PROTOCOL_VERSION,
             static_cast<uint8_t>(ota_state),
             static_cast<uint8_t>(ota_error),
@@ -1123,6 +1178,14 @@ uint16_t bluetooth_read_callback(
         write_little_endian_u32(&status_bytes[4], ota_bytes_received);
         write_little_endian_u32(&status_bytes[8], ota_total_bytes);
         write_little_endian_u32(&status_bytes[12], ota_blocks_received);
+        status_bytes[16] = static_cast<uint8_t>(current_boot_partition);
+        status_bytes[17] = current_boot_type;
+        status_bytes[18] = current_tbyb_and_update_info;
+        status_bytes[19] = update_confirmation_attempted ? 1 : 0;
+        write_little_endian_u32(
+            &status_bytes[20],
+            static_cast<uint32_t>(update_confirmation_result));
+        write_little_endian_u32(&status_bytes[24], current_boot_diagnostic);
         return att_read_callback_handle_blob(
             status_bytes,
             sizeof(status_bytes),
