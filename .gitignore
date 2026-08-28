@@ -6,3 +6,4 @@ __pycache__/
 .fake
 rick_v2_pico.code-workspace
 rick_pico.code-workspace
+checkpoints/
