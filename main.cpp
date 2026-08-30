@@ -69,9 +69,8 @@ float SERVO_CENTERS_US[ACTION_DIM] = {
     1455.0f, 1545.0f, 1590.0f, 1570.0f,
 };
 
-// A conventional 500--2500 us servo spans approximately pi radians. The
-// training environment commands default_pose + 0.35 * policy_action radians;
-// POLICY_ACTION_SCALE_RAD is generated from that environment config.
+// A conventional 500--2500 us servo spans approximately pi radians.
+// POLICY_ACTION_SCALE_RAD is generated from the training environment config.
 constexpr float SERVO_US_PER_RAD = 1000.0f / (PI_F / 2.0f);
 constexpr float SERVO_MIN_US = 800.0f;
 constexpr float SERVO_MAX_US = 2200.0f;
