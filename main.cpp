@@ -89,7 +89,10 @@ float normalized_obs[OBS_DIM];
 float network_buffer_a[POLICY_MAX_LAYER_DIM];
 float network_buffer_b[POLICY_MAX_LAYER_DIM];
 
-// Madgwick filter state. Identity gives projected gravity [0, 0, -1].
+// Madgwick filter state. Identity gives projected gravity [0, 0, -1].  The
+// estimate is initialized once at boot, updated continuously while the robot
+// is stopped, and preserved across policy/servo resets so START uses a settled
+// gravity estimate.
 float q0 = 1.0f;
 float q1 = 0.0f;
 float q2 = 0.0f;
@@ -485,11 +488,7 @@ void update_servos(const float *actions) {
     }
 }
 
-void reset_policy_state(float previous_action) {
-    q0 = 1.0f;
-    q1 = 0.0f;
-    q2 = 0.0f;
-    q3 = 0.0f;
+void reset_policy_history_and_clock(float previous_action) {
     gait_phase = 0.0f;
     step_counter = 0;
     run_control_step = false;
@@ -510,7 +509,7 @@ void reset_servos(float action) {
     for (float &target_action : target_actions) {
         target_action = action;
     }
-    reset_policy_state(action);
+    reset_policy_history_and_clock(action);
     update_servos(target_actions);
 }
 
@@ -580,9 +579,10 @@ void apply_control_command(ControlCommand command) {
             break;
 
         case ControlCommand::START:
-            // Preserve the held pose in command history while resetting the IMU
-            // estimate and gait clock for a clean policy start.
-            reset_policy_state(target_actions[0]);
+            // Preserve both the held pose in command history and the attitude
+            // estimate prewarmed while stopped.  Only the gait clock and
+            // policy history restart.
+            reset_policy_history_and_clock(target_actions[0]);
             for (int history_index = 0; history_index < HISTORY_LEN; ++history_index) {
                 for (int action_index = 0; action_index < ACTION_DIM; ++action_index) {
                     current_obs[history_index * ACTION_DIM + action_index] =
@@ -1498,9 +1498,10 @@ int main() {
                 continue;
             }
             read_imu(&gx, &gy, &gz, &ax, &ay, &az);
+            madgwick_update_6dof(
+                gx, gy, gz, ax, ay, az, POLICY_CONTROL_DT);
 
             if (robot_running) {
-                madgwick_update_6dof(gx, gy, gz, ax, ay, az, POLICY_CONTROL_DT);
                 update_imu_and_clock_observation(gx, gy, gz);
 
                 infer_action(current_obs, target_actions);

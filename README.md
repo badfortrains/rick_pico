@@ -77,8 +77,9 @@ Copy `bluetooth.html` to the Android device and open it in Chrome, then:
    - **Reset to full action** stops the policy and sends normalized policy
      action `+1.0` to every servo (the full trained action range around each
      calibrated center, with `SERVO_DIRS` applied).
-   - **Start** resets the gait clock and IMU orientation estimate, then runs the
-     PPO policy at 50 Hz.
+   - **Start** resets the gait clock while preserving the IMU orientation
+     estimate prewarmed continuously while stopped, then runs the PPO policy
+     at 50 Hz.
    - **Stop** stops policy inference and holds the last commanded servo pose.
 
 The same page includes two calibration tools:
