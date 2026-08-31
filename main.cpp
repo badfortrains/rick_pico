@@ -129,9 +129,11 @@ bool robot_running = false;
 bool servo_calibration_active = false;
 hci_con_handle_t bluetooth_connection_handle = HCI_CON_HANDLE_INVALID;
 
-// BLE OTA protocol. A complete UF2 stream is written to the inactive RP2350
-// A/B partition. The currently running partition is never erased.
-constexpr uint8_t OTA_PROTOCOL_VERSION = 1;
+// BLE OTA protocol. Version 2 receives only the validated 256-byte payload
+// from each UF2 block, cutting the radio transfer in half. Pages are written
+// sequentially to the inactive RP2350 A/B partition, so the currently running
+// partition is never erased.
+constexpr uint8_t OTA_PROTOCOL_VERSION = 2;
 constexpr uint8_t OTA_CONTROL_BEGIN = 1;
 constexpr uint8_t OTA_CONTROL_ABORT = 2;
 constexpr uint8_t OTA_CONTROL_COMMIT = 3;
@@ -140,7 +142,10 @@ constexpr size_t OTA_SHA256_SIZE = SHA256_RESULT_BYTES;
 constexpr size_t OTA_BEGIN_PACKET_SIZE = 1 + 4 + 4;
 constexpr size_t OTA_MAX_CONTROL_PACKET_SIZE = 20;
 constexpr size_t OTA_MAX_DIGEST_CHUNK_SIZE = 18;
-constexpr size_t OTA_MAX_DATA_VALUE_SIZE = 244;
+// Web Bluetooth caps an attribute value at 512 bytes. Reserve four bytes for
+// the stream offset and accept as many as 508 firmware bytes. Clients with a
+// smaller negotiated MTU fall back to smaller chunks.
+constexpr size_t OTA_MAX_DATA_VALUE_SIZE = 512;
 constexpr size_t OTA_WORKAREA_SIZE = 4096;
 constexpr uint32_t OTA_FLASH_SECTOR_SIZE = 4096;
 constexpr uint32_t OTA_FLASH_PAGE_SIZE = 256;
@@ -160,7 +165,7 @@ enum class OtaError : uint8_t {
     INVALID_REQUEST = 1,
     NO_PARTITION = 2,
     HASH_UNAVAILABLE = 3,
-    INVALID_UF2 = 4,
+    INVALID_IMAGE = 4,
     OUT_OF_ORDER = 5,
     OUT_OF_RANGE = 6,
     FLASH_OPERATION = 7,
@@ -196,11 +201,11 @@ uint32_t current_boot_diagnostic = 0;
 bool ota_sha_active = false;
 uint8_t ota_expected_sha256[OTA_SHA256_SIZE] = {0};
 uint32_t ota_digest_bytes_received = 0;
-uint8_t ota_uf2_block_bytes[sizeof(uf2_block)] = {0};
-uint32_t ota_uf2_block_used = 0;
+alignas(4) uint8_t ota_page_bytes[OTA_FLASH_PAGE_SIZE] = {0};
+uint32_t ota_page_used = 0;
 uint32_t ota_total_bytes = 0;
 uint32_t ota_bytes_received = 0;
-uint32_t ota_blocks_received = 0;
+uint32_t ota_pages_received = 0;
 uint32_t ota_target_partition = 0xff;
 uint32_t ota_target_storage_base = 0;
 uint32_t ota_target_storage_end = 0;
@@ -721,11 +726,11 @@ void ota_fail(OtaError error) {
 void ota_reset() {
     ota_cleanup_hash();
     drain_ota_data_queue();
-    ota_uf2_block_used = 0;
+    ota_page_used = 0;
     ota_digest_bytes_received = 0;
     ota_total_bytes = 0;
     ota_bytes_received = 0;
-    ota_blocks_received = 0;
+    ota_pages_received = 0;
     ota_target_partition = 0xff;
     ota_target_storage_base = 0;
     ota_target_storage_end = 0;
@@ -799,7 +804,7 @@ void begin_ota_update(const OtaControlPacket &packet) {
 
     const uint32_t total_bytes = read_little_endian_u32(&packet.bytes[1]);
     const uint32_t family_id = read_little_endian_u32(&packet.bytes[5]);
-    if (total_bytes == 0 || total_bytes % sizeof(uf2_block) != 0 ||
+    if (total_bytes == 0 || total_bytes % OTA_FLASH_PAGE_SIZE != 0 ||
         family_id != RP2350_RISCV_FAMILY_ID) {
         ota_fail(OtaError::INVALID_REQUEST);
         return;
@@ -840,9 +845,8 @@ void begin_ota_update(const OtaControlPacket &packet) {
                        OTA_FLASH_SECTOR_SIZE;
     const uint32_t partition_size =
         ota_target_storage_end - ota_target_storage_base;
-    const uint32_t block_count = total_bytes / sizeof(uf2_block);
-    if (static_cast<uint64_t>(block_count) * OTA_FLASH_PAGE_SIZE >
-        partition_size) {
+    const uint32_t page_count = total_bytes / OTA_FLASH_PAGE_SIZE;
+    if (total_bytes > partition_size) {
         ota_fail(OtaError::OUT_OF_RANGE);
         return;
     }
@@ -861,8 +865,8 @@ void begin_ota_update(const OtaControlPacket &packet) {
     ota_error = OtaError::NONE;
     ota_state = OtaState::PREPARING;
     printf(
-        "Firmware update prepared: %lu UF2 blocks to partition %d.\n",
-        static_cast<unsigned long>(block_count),
+        "Firmware update prepared: %lu compact pages to partition %d.\n",
+        static_cast<unsigned long>(page_count),
         partition_result);
 }
 
@@ -889,34 +893,13 @@ void receive_ota_digest(const OtaControlPacket &packet) {
     ota_digest_bytes_received += digest_length;
     if (ota_digest_bytes_received == sizeof(ota_expected_sha256)) {
         ota_state = OtaState::RECEIVING;
-        printf("Firmware update digest received; accepting UF2 data.\n");
+        printf("Firmware update digest received; accepting compact image data.\n");
     }
 }
 
-bool program_ota_uf2_block() {
-    const uf2_block *block =
-        reinterpret_cast<const uf2_block *>(ota_uf2_block_bytes);
-    const uint32_t expected_block_count =
-        ota_total_bytes / sizeof(uf2_block);
-    const uint32_t expected_target_address =
-        XIP_BASE + ota_blocks_received * OTA_FLASH_PAGE_SIZE;
-
-    if (block->magic_start0 != UF2_MAGIC_START0 ||
-        block->magic_start1 != UF2_MAGIC_START1 ||
-        block->magic_end != UF2_MAGIC_END ||
-        (block->flags & UF2_FLAG_FAMILY_ID_PRESENT) == 0 ||
-        (block->flags & UF2_FLAG_NOT_MAIN_FLASH) != 0 ||
-        block->file_size != RP2350_RISCV_FAMILY_ID ||
-        block->payload_size != OTA_FLASH_PAGE_SIZE ||
-        block->block_no != ota_blocks_received ||
-        block->num_blocks != expected_block_count ||
-        block->target_addr != expected_target_address) {
-        ota_fail(OtaError::INVALID_UF2);
-        return false;
-    }
-
+bool program_ota_page() {
     const uint32_t target_address =
-        ota_target_storage_base + (block->target_addr - XIP_BASE);
+        ota_target_storage_base + ota_pages_received * OTA_FLASH_PAGE_SIZE;
     if (target_address < ota_target_storage_base ||
         target_address + OTA_FLASH_PAGE_SIZE > ota_target_storage_end) {
         ota_fail(OtaError::OUT_OF_RANGE);
@@ -949,21 +932,21 @@ bool program_ota_uf2_block() {
         flags,
         target_address,
         OTA_FLASH_PAGE_SIZE,
-        const_cast<uint8_t *>(block->data));
+        ota_page_bytes);
     if (result != BOOTROM_OK) {
         ota_fail(OtaError::FLASH_OPERATION);
         return false;
     }
 
-    ++ota_blocks_received;
-    ota_uf2_block_used = 0;
+    ++ota_pages_received;
+    ota_page_used = 0;
     return true;
 }
 
 void finish_ota_receive() {
-    if (!ota_sha_active || ota_uf2_block_used != 0 ||
-        ota_blocks_received != ota_total_bytes / sizeof(uf2_block)) {
-        ota_fail(OtaError::INVALID_UF2);
+    if (!ota_sha_active || ota_page_used != 0 ||
+        ota_pages_received != ota_total_bytes / OTA_FLASH_PAGE_SIZE) {
+        ota_fail(OtaError::INVALID_IMAGE);
         return;
     }
 
@@ -978,7 +961,7 @@ void finish_ota_receive() {
         return;
     }
 
-    // The transfer hash above proves that BLE delivered the selected UF2.
+    // The transfer hash above proves that BLE delivered the compact image.
     // Ask the boot ROM to parse and verify the programmed image too, so READY
     // means this exact A/B slot is bootable rather than merely byte-complete.
     rom_flash_flush_cache();
@@ -1025,17 +1008,17 @@ void process_ota_data_packet(const OtaDataPacket &packet) {
            ota_state == OtaState::RECEIVING) {
         const uint32_t copy_size = std::min(
             data_length - source_offset,
-            static_cast<uint32_t>(sizeof(uf2_block)) - ota_uf2_block_used);
+            static_cast<uint32_t>(sizeof(ota_page_bytes)) - ota_page_used);
         std::memcpy(
-            &ota_uf2_block_bytes[ota_uf2_block_used],
+            &ota_page_bytes[ota_page_used],
             &packet.bytes[4 + source_offset],
             copy_size);
-        ota_uf2_block_used += copy_size;
+        ota_page_used += copy_size;
         ota_bytes_received += copy_size;
         source_offset += copy_size;
 
-        if (ota_uf2_block_used == sizeof(uf2_block) &&
-            !program_ota_uf2_block()) {
+        if (ota_page_used == sizeof(ota_page_bytes) &&
+            !program_ota_page()) {
             return;
         }
     }
@@ -1176,7 +1159,7 @@ uint16_t bluetooth_read_callback(
         };
         write_little_endian_u32(&status_bytes[4], ota_bytes_received);
         write_little_endian_u32(&status_bytes[8], ota_total_bytes);
-        write_little_endian_u32(&status_bytes[12], ota_blocks_received);
+        write_little_endian_u32(&status_bytes[12], ota_pages_received);
         status_bytes[16] = static_cast<uint8_t>(current_boot_partition);
         status_bytes[17] = current_boot_type;
         status_bytes[18] = current_tbyb_and_update_info;
@@ -1363,11 +1346,45 @@ void bluetooth_packet_handler(
                 GAP_SUBEVENT_LE_CONNECTION_COMPLETE) {
                 bluetooth_connection_handle =
                     gap_subevent_le_connection_complete_get_connection_handle(packet);
+                const uint16_t connection_interval =
+                    gap_subevent_le_connection_complete_get_conn_interval(packet);
                 // Android Web Bluetooth pairs transparently when an encrypted
                 // characteristic is first written. Starting pairing here can
                 // race Android's GATT discovery and leave its first read
                 // pending until the connection times out.
-                printf("Bluetooth connected; waiting for an encrypted command.\n");
+                printf(
+                    "Bluetooth connected at %u.%02u ms; requesting 15 ms for OTA.\n",
+                    connection_interval * 125 / 100,
+                    25 * (connection_interval & 3));
+                const int update_result = gap_request_connection_parameter_update(
+                    bluetooth_connection_handle,
+                    12,
+                    12,
+                    0,
+                    0x0048);
+                if (update_result != ERROR_CODE_SUCCESS) {
+                    printf(
+                        "Bluetooth connection interval request failed (%d).\n",
+                        update_result);
+                }
+            }
+            break;
+
+        case HCI_EVENT_LE_META:
+            if (hci_event_le_meta_get_subevent_code(packet) ==
+                HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE &&
+                hci_subevent_le_connection_update_complete_get_connection_handle(packet) ==
+                    bluetooth_connection_handle) {
+                const uint8_t status =
+                    hci_subevent_le_connection_update_complete_get_status(packet);
+                const uint16_t connection_interval =
+                    hci_subevent_le_connection_update_complete_get_conn_interval(packet);
+                printf(
+                    "Bluetooth connection update status 0x%02x: %u.%02u ms, latency %u.\n",
+                    status,
+                    connection_interval * 125 / 100,
+                    25 * (connection_interval & 3),
+                    hci_subevent_le_connection_update_complete_get_conn_latency(packet));
             }
             break;
 

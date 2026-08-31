@@ -704,7 +704,8 @@
     const OTA_DATA_UUID = "7e57a006-4c91-4d8e-8f2a-7dca6d5a1000";
     const OTA_STATUS_UUID = "7e57a007-4c91-4d8e-8f2a-7dca6d5a1000";
 
-    const OTA_PROTOCOL_VERSION = 1;
+    const OTA_PROTOCOL_VERSION_LEGACY = 1;
+    const OTA_PROTOCOL_VERSION_COMPACT = 2;
     const OTA_CONTROL_BEGIN = 1;
     const OTA_CONTROL_ABORT = 2;
     const OTA_CONTROL_COMMIT = 3;
@@ -715,7 +716,8 @@
     const OTA_STATE_ERROR = 3;
     const OTA_STATE_REBOOTING = 4;
     const OTA_STATE_PREPARING = 5;
-    const OTA_DATA_CHUNK_SIZES = [240, 120, 60, 16];
+    const OTA_LEGACY_DATA_CHUNK_SIZES = [240, 120, 60, 16];
+    const OTA_COMPACT_DATA_CHUNK_SIZES = [508, 240, 120, 60, 16];
     const UF2_BLOCK_SIZE = 512;
     const UF2_PAYLOAD_SIZE = 256;
     const UF2_MAGIC_START0 = 0x0a324655;
@@ -730,7 +732,7 @@
       "The update request was invalid",
       "The inactive firmware partition is unavailable",
       "SHA-256 verification could not start",
-      "The UF2 structure is invalid",
+      "The firmware image is invalid",
       "An update chunk arrived out of order",
       "The firmware does not fit the update partition",
       "Flash programming failed",
@@ -794,6 +796,7 @@
     let otaControlCharacteristic = null;
     let otaDataCharacteristic = null;
     let otaStatusCharacteristic = null;
+    let otaProtocolVersion = null;
     let busy = false;
     let otaUpdating = false;
     let otaCancelRequested = false;
@@ -873,6 +876,44 @@
       return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
     }
 
+    function firmwareTransferForProtocol(firmware, protocolVersion) {
+      if (protocolVersion === OTA_PROTOCOL_VERSION_COMPACT) {
+        return {
+          stream: firmware.compactStream,
+          digest: firmware.compactDigest,
+          chunkSizes: OTA_COMPACT_DATA_CHUNK_SIZES,
+          label: "compact"
+        };
+      }
+      if (protocolVersion === OTA_PROTOCOL_VERSION_LEGACY) {
+        return {
+          stream: firmware.uf2Stream,
+          digest: firmware.uf2Digest,
+          chunkSizes: OTA_LEGACY_DATA_CHUNK_SIZES,
+          label: "legacy"
+        };
+      }
+      throw new Error("RickBot uses an incompatible update protocol");
+    }
+
+    function showSelectedFirmwareReady() {
+      if (!selectedFirmware) return;
+      const transfer = firmwareTransferForProtocol(
+        selectedFirmware,
+        otaProtocolVersion
+      );
+      showFirmwareStatus(
+        "READY",
+        `${selectedFirmware.name} · ${formatBytes(selectedFirmware.codeSize)} firmware · ${formatBytes(transfer.stream.byteLength)} ${transfer.label} BLE transfer`,
+        true
+      );
+      showFirmwareProgress(
+        0,
+        transfer.stream.byteLength,
+        "Verified locally and ready to upload."
+      );
+    }
+
     function showFirmwareProgress(value, maximum, text) {
       firmwareProgress.max = Math.max(1, maximum);
       firmwareProgress.value = Math.min(value, firmwareProgress.max);
@@ -900,9 +941,11 @@
       copyCenters.disabled = busy;
       connectButton.disabled = busy || !bluetoothSupported;
       connectButton.textContent = isConnected() ? "Disconnect" : "Pair & connect";
-      firmwareFileInput.disabled = !otaIsAvailable() || busy;
+      firmwareFileInput.disabled =
+        !otaIsAvailable() || otaProtocolVersion === null || busy;
       installFirmware.disabled =
-        !otaIsAvailable() || !selectedFirmware || busy || otaUpdating;
+        !otaIsAvailable() || otaProtocolVersion === null ||
+        !selectedFirmware || busy || otaUpdating;
       abortFirmware.hidden = !otaUpdating;
       abortFirmware.disabled = !otaUpdating || !isConnected();
     }
@@ -1005,11 +1048,14 @@
       const characteristic = otaStatusCharacteristic;
       const value = await queueGattOperation(() => characteristic.readValue());
       if (value.byteLength < 16) throw new Error("Firmware update status was incomplete");
-      if (value.getUint8(0) !== OTA_PROTOCOL_VERSION) {
+      const protocolVersion = value.getUint8(0);
+      if (protocolVersion !== OTA_PROTOCOL_VERSION_LEGACY &&
+          protocolVersion !== OTA_PROTOCOL_VERSION_COMPACT) {
         throw new Error("RickBot uses an incompatible update protocol");
       }
       const extendedStatus = value.byteLength >= 28;
       return {
+        protocolVersion,
         state: value.getUint8(1),
         error: value.getUint8(2),
         targetPartition: value.getUint8(3),
@@ -1090,17 +1136,27 @@
         throw new Error("The UF2 does not contain a complete Pico 2 W RISC-V image");
       }
 
-      const stream = new Uint8Array(codeBlocks.length * UF2_BLOCK_SIZE);
+      const uf2Stream = new Uint8Array(codeBlocks.length * UF2_BLOCK_SIZE);
+      const compactStream = new Uint8Array(codeBlocks.length * UF2_PAYLOAD_SIZE);
       codeBlocks.forEach((block, index) => {
-        stream.set(block, index * UF2_BLOCK_SIZE);
+        uf2Stream.set(block, index * UF2_BLOCK_SIZE);
+        compactStream.set(
+          block.subarray(32, 32 + UF2_PAYLOAD_SIZE),
+          index * UF2_PAYLOAD_SIZE
+        );
       });
-      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", stream));
+      const [uf2DigestBuffer, compactDigestBuffer] = await Promise.all([
+        crypto.subtle.digest("SHA-256", uf2Stream),
+        crypto.subtle.digest("SHA-256", compactStream)
+      ]);
       return {
         name: file.name,
-        stream,
-        digest,
+        uf2Stream,
+        compactStream,
+        uf2Digest: new Uint8Array(uf2DigestBuffer),
+        compactDigest: new Uint8Array(compactDigestBuffer),
         family: UF2_RP2350_RISCV_FAMILY,
-        codeSize: codeBlocks.length * UF2_PAYLOAD_SIZE,
+        codeSize: compactStream.byteLength,
         blockCount: codeBlocks.length
       };
     }
@@ -1121,12 +1177,7 @@
 
       try {
         selectedFirmware = await parseUf2Firmware(file);
-        showFirmwareStatus(
-          "READY",
-          `${selectedFirmware.name} · ${formatBytes(selectedFirmware.codeSize)} firmware · ${formatBytes(selectedFirmware.stream.byteLength)} BLE transfer`,
-          true
-        );
-        showFirmwareProgress(0, selectedFirmware.stream.byteLength, "Verified locally and ready to upload.");
+        showSelectedFirmwareReady();
       } catch (error) {
         firmwareFileInput.value = "";
         showFirmwareStatus("INVALID", error.message || error.name);
@@ -1161,6 +1212,16 @@
 
     async function installSelectedFirmware() {
       if (!selectedFirmware || !otaIsAvailable() || busy) return;
+      let transfer;
+      try {
+        transfer = firmwareTransferForProtocol(
+          selectedFirmware,
+          otaProtocolVersion
+        );
+      } catch (error) {
+        showFirmwareStatus("INCOMPATIBLE", error.message || error.name);
+        return;
+      }
       if (!window.confirm(
         "Install this firmware now? RickBot will stop moving, hold its current pose, and reboot when verification succeeds."
       )) return;
@@ -1173,29 +1234,41 @@
       showConnection("Updating…", "Policy stopped · keep RickBot powered", "working");
       setMessage("Preparing the inactive firmware partition…");
       showFirmwareStatus("STARTING", selectedFirmware.name, true);
-      showFirmwareProgress(0, selectedFirmware.stream.byteLength, "Preparing RickBot for the upload…");
+      showFirmwareProgress(0, transfer.stream.byteLength, "Preparing RickBot for the upload…");
       updateButtons();
 
       try {
+        const preflightStatus = await readOtaStatus();
+        otaProtocolVersion = preflightStatus.protocolVersion;
+        transfer = firmwareTransferForProtocol(
+          selectedFirmware,
+          otaProtocolVersion
+        );
+        showFirmwareProgress(
+          0,
+          transfer.stream.byteLength,
+          "Preparing RickBot for the upload…"
+        );
+
         const beginPacket = new Uint8Array(9);
         const beginView = new DataView(beginPacket.buffer);
         beginView.setUint8(0, OTA_CONTROL_BEGIN);
-        beginView.setUint32(1, selectedFirmware.stream.byteLength, true);
+        beginView.setUint32(1, transfer.stream.byteLength, true);
         beginView.setUint32(5, selectedFirmware.family, true);
         await writeWithResponse(otaControlCharacteristic, beginPacket);
 
         for (let digestOffset = 0;
-             digestOffset < selectedFirmware.digest.byteLength;
+             digestOffset < transfer.digest.byteLength;
              digestOffset += 18) {
           const digestLength = Math.min(
             18,
-            selectedFirmware.digest.byteLength - digestOffset
+            transfer.digest.byteLength - digestOffset
           );
           const digestPacket = new Uint8Array(2 + digestLength);
           digestPacket[0] = OTA_CONTROL_DIGEST;
           digestPacket[1] = digestOffset;
           digestPacket.set(
-            selectedFirmware.digest.subarray(
+            transfer.digest.subarray(
               digestOffset,
               digestOffset + digestLength
             ),
@@ -1215,25 +1288,25 @@
         let chunkSizeIndex = 0;
         let retryCount = 0;
         let nextProgressRead = 8192;
-        while (offset < selectedFirmware.stream.byteLength) {
+        while (offset < transfer.stream.byteLength) {
           if (otaCancelRequested) throw new Error("Firmware update aborted");
 
           try {
             const sent = await sendOtaChunk(
-              selectedFirmware.stream,
+              transfer.stream,
               offset,
-              OTA_DATA_CHUNK_SIZES[chunkSizeIndex]
+              transfer.chunkSizes[chunkSizeIndex]
             );
             offset += sent;
             retryCount = 0;
           } catch (error) {
             if (error.otaFatal || !device?.gatt?.connected) throw error;
-            if (chunkSizeIndex < OTA_DATA_CHUNK_SIZES.length - 1) {
+            if (chunkSizeIndex < transfer.chunkSizes.length - 1) {
               ++chunkSizeIndex;
               showFirmwareProgress(
                 offset,
-                selectedFirmware.stream.byteLength,
-                `Bluetooth selected ${OTA_DATA_CHUNK_SIZES[chunkSizeIndex]}-byte chunks; continuing…`
+                transfer.stream.byteLength,
+                `Bluetooth selected ${transfer.chunkSizes[chunkSizeIndex]}-byte chunks; continuing…`
               );
               continue;
             }
@@ -1242,13 +1315,13 @@
             continue;
           }
 
-          if (offset >= nextProgressRead || offset === selectedFirmware.stream.byteLength) {
+          if (offset >= nextProgressRead || offset === transfer.stream.byteLength) {
             const status = await readOtaStatus();
             if (status.state === OTA_STATE_ERROR) throw otaStatusError(status);
-            const percent = Math.floor((offset / selectedFirmware.stream.byteLength) * 100);
+            const percent = Math.floor((offset / transfer.stream.byteLength) * 100);
             showFirmwareProgress(
               offset,
-              selectedFirmware.stream.byteLength,
+              transfer.stream.byteLength,
               `${percent}% sent · ${formatBytes(status.received)} written safely to the inactive slot`
             );
             nextProgressRead = offset + 8192;
@@ -1257,16 +1330,16 @@
 
         showFirmwareStatus("VERIFYING", selectedFirmware.name, true);
         showFirmwareProgress(
-          selectedFirmware.stream.byteLength,
-          selectedFirmware.stream.byteLength,
+          transfer.stream.byteLength,
+          transfer.stream.byteLength,
           "Upload complete. RickBot is checking the full SHA-256 hash…"
         );
         await waitForOtaState([OTA_STATE_READY], 60000);
 
         showFirmwareStatus("REBOOTING", "Verified successfully · switching firmware slots", true);
         showFirmwareProgress(
-          selectedFirmware.stream.byteLength,
-          selectedFirmware.stream.byteLength,
+          transfer.stream.byteLength,
+          transfer.stream.byteLength,
           "Verified. RickBot is rebooting into the new firmware…"
         );
         otaCommitSent = true;
@@ -1359,6 +1432,7 @@
           otaControlCharacteristic = null;
           otaDataCharacteristic = null;
           otaStatusCharacteristic = null;
+          otaProtocolVersion = null;
         }
 
         showConnection("Initializing…", "Reading RickBot state", "working");
@@ -1375,6 +1449,7 @@
           await readImuTelemetry();
           if (otaIsAvailable()) {
             const otaStatus = await readOtaStatus();
+            otaProtocolVersion = otaStatus.protocolVersion;
             if (expectedBootPartition !== null &&
                 otaStatus.bootPartition !== null) {
               if (otaStatus.bootPartition === expectedBootPartition &&
@@ -1449,6 +1524,7 @@
         otaControlCharacteristic = null;
         otaDataCharacteristic = null;
         otaStatusCharacteristic = null;
+        otaProtocolVersion = null;
         if (device?.gatt?.connected) device.gatt.disconnect();
 
         if (error.name === "NotFoundError") {
@@ -1476,6 +1552,7 @@
       otaControlCharacteristic = null;
       otaDataCharacteristic = null;
       otaStatusCharacteristic = null;
+      otaProtocolVersion = null;
       busy = false;
       otaUpdating = false;
       otaCancelRequested = false;

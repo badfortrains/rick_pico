@@ -164,10 +164,19 @@ during the first application boot.
    seconds; the page then reports whether the new slot was confirmed or the
    boot ROM rolled back to the previous slot.
 
-The page accepts only complete RP2350 RISC-V Rick firmware UF2s, hashes the
-transfer before it starts, and shows both upload and device-written progress.
-The firmware independently validates every UF2 block, its target range and
-order, the full SHA-256 transfer digest, and the programmed slot with the
+The page accepts only complete RP2350 RISC-V Rick firmware UF2s and validates
+every block before uploading. Protocol-v2 firmware receives only each block's
+256-byte flash payload instead of its full 512-byte UF2 wrapper, cutting the
+radio transfer roughly in half. The page tries 508-byte data chunks when the
+negotiated ATT MTU permits them and automatically falls back as far as 16-byte
+chunks. Firmware also requests a 15 ms BLE connection interval, though the
+Android device makes the final connection-parameter decision.
+
+The page remains compatible with protocol-v1 firmware and uses the original
+full-UF2, 240-byte-chunk transfer for the one update that installs protocol v2.
+Later updates automatically use the compact path. The firmware independently
+validates the requested family, compact image length, stream order, target
+partition range, full SHA-256 transfer digest, and programmed slot with the
 RP2350 boot ROM before enabling the reboot. The update GATT characteristics
 require the same encrypted BLE connection as robot-changing commands. USB
 BOOTSEL remains the recovery path if both firmware slots are ever damaged.
