@@ -725,6 +725,7 @@
     const UF2_MAGIC_END = 0x0ab16f30;
     const UF2_FLAG_FAMILY_ID_PRESENT = 0x00002000;
     const UF2_ABSOLUTE_FAMILY = 0xe48bff57;
+    const UF2_RP2350_ARM_S_FAMILY = 0xe48bff59;
     const UF2_RP2350_RISCV_FAMILY = 0xe48bff5a;
 
     const otaErrorLabels = [
@@ -1067,7 +1068,10 @@
         buyPending: extendedStatus ? (value.getUint8(18) & 1) !== 0 : null,
         confirmationAttempted: extendedStatus ? value.getUint8(19) !== 0 : null,
         confirmationResult: extendedStatus ? value.getInt32(20, true) : null,
-        bootDiagnostic: extendedStatus ? value.getUint32(24, true) : null
+        bootDiagnostic: extendedStatus ? value.getUint32(24, true) : null,
+        // Firmware predating this field supported only RISC-V updates.
+        firmwareFamily: value.byteLength >= 32
+          ? value.getUint32(28, true) : UF2_RP2350_RISCV_FAMILY
       };
     }
 
@@ -1095,6 +1099,7 @@
 
       const codeBlocks = [];
       let expectedCodeBlocks = null;
+      let firmwareFamily = null;
       for (let offset = 0; offset < fileBytes.byteLength; offset += UF2_BLOCK_SIZE) {
         const view = new DataView(
           fileBytes.buffer,
@@ -1110,9 +1115,12 @@
         const flags = view.getUint32(8, true);
         const family = view.getUint32(28, true);
         if (family === UF2_ABSOLUTE_FAMILY) continue;
-        if (family !== UF2_RP2350_RISCV_FAMILY) {
-          throw new Error("Choose the RISC-V rick_v2_pico.uf2 build for Pico 2 W");
+        if (family !== UF2_RP2350_RISCV_FAMILY &&
+            family !== UF2_RP2350_ARM_S_FAMILY) {
+          throw new Error("Choose the ARM or RISC-V rick_v2_pico.uf2 build for Pico 2 W");
         }
+        if (firmwareFamily === null) firmwareFamily = family;
+        if (family !== firmwareFamily) throw new Error("The UF2 mixes CPU architectures");
         if ((flags & UF2_FLAG_FAMILY_ID_PRESENT) === 0 ||
             view.getUint32(16, true) !== UF2_PAYLOAD_SIZE) {
           throw new Error("The UF2 contains an unsupported firmware block");
@@ -1133,7 +1141,7 @@
       }
 
       if (codeBlocks.length === 0 || codeBlocks.length !== expectedCodeBlocks) {
-        throw new Error("The UF2 does not contain a complete Pico 2 W RISC-V image");
+        throw new Error("The UF2 does not contain a complete Pico 2 W application image");
       }
 
       const uf2Stream = new Uint8Array(codeBlocks.length * UF2_BLOCK_SIZE);
@@ -1155,7 +1163,7 @@
         compactStream,
         uf2Digest: new Uint8Array(uf2DigestBuffer),
         compactDigest: new Uint8Array(compactDigestBuffer),
-        family: UF2_RP2350_RISCV_FAMILY,
+        family: firmwareFamily,
         codeSize: compactStream.byteLength,
         blockCount: codeBlocks.length
       };
@@ -1210,6 +1218,12 @@
       }
     }
 
+    function checkFirmwareFamily(firmware, status) {
+      if (firmware.family !== status.firmwareFamily) {
+        throw new Error("Switching between ARM and RISC-V requires a USB firmware install. Bluetooth updates work after that first install.");
+      }
+    }
+
     async function installSelectedFirmware() {
       if (!selectedFirmware || !otaIsAvailable() || busy) return;
       let transfer;
@@ -1239,6 +1253,7 @@
 
       try {
         const preflightStatus = await readOtaStatus();
+        checkFirmwareFamily(selectedFirmware, preflightStatus);
         otaProtocolVersion = preflightStatus.protocolVersion;
         transfer = firmwareTransferForProtocol(
           selectedFirmware,

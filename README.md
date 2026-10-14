@@ -15,21 +15,27 @@ python export_policy.py \
 ```
 
 By default this replaces `policy_weights.h` beside the script. The exporter
-checks the PPO configuration, all layer shapes, the 41-value Rick observation
+checks the PPO configuration, all layer shapes, the Rick observation
 layout, and float32 serialization before writing the header.
 
 The deployed observation is:
 
-- indices 0--31: four previous 8-servo commands, oldest first
-- indices 32--34: body-frame projected gravity
-- indices 35--37: body-frame gyro in rad/s, scaled by 0.25
-- indices 38--39: sine/cosine of the 0.8 Hz gait clock
-- index 40: target forward velocity (0.06 m/s)
+- indices 0--95: twelve previous 8-servo commands, oldest first
+- indices 96--98: body-frame projected gravity
+- indices 99--101: body-frame gyro in rad/s, scaled by 0.25
+- indices 102--103: sine/cosine of the 0.8 Hz gait clock
+- index 104: target forward velocity (0.068 m/s)
 
-The network is `41 -> 128 -> 128 -> 128 -> 128 -> 16` with SiLU hidden
+The current network is `105 -> 128 -> 128 -> 128 -> 128 -> 16` with SiLU hidden
 activations. Deterministic actions are `tanh` of the first eight outputs. The
-current checkpoint contains 56,976 float32 policy parameters (about 223 KiB in
+current checkpoint contains 65,168 float32 policy parameters (about 255 KiB in
 flash, before code).
+
+These dimensions and constants come from `policy_weights.h`; the controller
+also supports older exported history lengths. Inference streams each row of
+the exported Flax weight matrices contiguously from flash, preserving each
+output's accumulation order. No checkpoint re-export is needed for this
+optimization.
 
 ## Servo wiring and calibration
 
@@ -53,8 +59,8 @@ pin assignments and the calibrated 1460/1440 us foot centers were retained at
 their corresponding shifted indices.
 
 Test with the robot supported off the ground first. The policy was trained
-with `action_scale = 0.35` radians, so the firmware converts a policy action of
-`+/-1` to only about `+/-223 us` around each calibrated center. Servos need an
+with `action_scale = 0.40` radians, so the firmware converts a policy action of
+`+/-1` to about `+/-255 us` around each calibrated center. Servos need an
 external power supply with a common ground; do not power eight servos from the
 Pico.
 
@@ -165,8 +171,13 @@ during the first application boot.
    seconds; the page then reports whether the new slot was confirmed or the
    boot ROM rolled back to the previous slot.
 
-The page accepts only complete RP2350 RISC-V Rick firmware UF2s and validates
-every block before uploading. Protocol-v2 firmware receives only each block's
+The page accepts complete RP2350 ARM Secure or RISC-V Rick firmware UF2s and
+validates every block before uploading, rejecting mixed architectures. The
+firmware accepts only its own CPU architecture; switching architectures
+requires a USB install first (see below). The extended OTA status includes
+the running firmware's family ID, so the page detects this before uploading.
+Older firmware without this field is recognized as RISC-V.
+Protocol-v2 firmware receives only each block's
 256-byte flash payload instead of its full 512-byte UF2 wrapper, cutting the
 radio transfer roughly in half. The page tries 508-byte data chunks when the
 negotiated ATT MTU permits them and automatically falls back as far as 16-byte
@@ -184,8 +195,79 @@ BOOTSEL remains the recovery path if both firmware slots are ever damaged.
 
 ## Build
 
-The project targets `pico2_w` in `CMakeLists.txt` and requires Pico SDK 2.3.0
-and Picotool 2.3.0 for the RP2350 A/B update flow. Build and flash it through
-the Raspberry Pi Pico VS Code extension as before. Ensure the SDK's `btstack`
-and `cyw43-driver` submodules are installed; the Pico extension normally
-manages these.
+The project defaults to `pico2_w`, `rp2350-arm-s`, and the Cortex-M33 hardware
+single-precision FPU. It uses Pico SDK 2.3.0, ARM toolchain 15_2_Rel1, and
+Picotool 2.3.0. Ensure the SDK's `btstack` and `cyw43-driver` submodules are
+installed; the Pico extension normally manages these.
+
+When changing from a cached RISC-V build, configure afresh, using the CMake
+and Ninja installed by the Pico extension (or equivalent executables on PATH):
+
+```sh
+cmake --fresh -S . -B build -G Ninja -DPICO_PLATFORM=rp2350-arm-s -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
+
+The output is `build/rick_v2_pico.uf2`. For a robot already using the resident
+A/B partition table, enter USB BOOTSEL and install the ARM application with
+Picotool so it performs the flash-update boot required by TBYB:
+
+```sh
+picotool load -v -x build/rick_v2_pico.uf2
+```
+
+The existing partition table already permits ARM and RISC-V; no replacement
+partition table is needed for this switch. The previously installed RISC-V
+firmware cannot accept the first ARM image over Bluetooth. Refresh/redeploy
+the updated Rick Control page as well; subsequent ARM updates use Bluetooth
+as usual. If no resident A/B table has been installed, use the one-time setup
+above first.
+
+For an optional RISC-V comparison build, use a separate directory:
+
+```sh
+cmake -S . -B build_riscv -G Ninja -DPICO_PLATFORM=rp2350-riscv -DCMAKE_BUILD_TYPE=Release
+cmake --build build_riscv --parallel
+```
+
+## Control timing diagnostics
+
+While the policy is running, USB serial reports one timing summary per
+second. Open the serial monitor, then tap **Start**. The boot message also
+identifies the CPU architecture, system clock, and target control period.
+
+- `hz`: completed policy updates per second; expect approximately **50**.
+- `infer_us(avg/max)`: mean and worst network inference time in microseconds.
+- `step_us(max)`: worst complete sensing/filter/inference/servo step time.
+- `dt_us(min/max)`: actual intervals between policy step starts; expect about
+  **20000 us** with small scheduling variation.
+- `missed`: scheduled releases skipped because the controller was late by at
+  least one entire period.
+- `overruns`: steps that finished after the next scheduled release.
+
+Counters and maxima cover the reporting window. Aim for zero misses and
+overruns, with worst step time comfortably below 20000 us. USB output has
+zero wait timeout, so a stalled serial reader can drop output instead of
+blocking control for the SDK's usual half-second timeout.
+
+The controller services monotonic deadlines and counts skipped releases
+instead of collapsing timer interrupts into a Boolean. It never replays a
+backlog of actions against stale sensor data. Madgwick uses the actual IMU
+sample interval, and gait phase advances with elapsed time, starting at zero
+on the first policy sample after Start. An OTA pause resets the IMU timestamp
+while retaining its attitude estimate. These changes expose and limit the
+effects of overruns; sustained rates below 50 Hz still violate the policy's
+trained command-history timing and must be resolved before gait evaluation.
+
+Host regression checks (no Pico needed):
+
+```sh
+c++ -std=c++17 -O3 -ffp-contract=off -Wall -Wextra -Werror -I. tests/control_test.cpp -o /tmp/rick_control_test
+/tmp/rick_control_test
+node tests/uf2_test.mjs build/rick_v2_pico.uf2
+```
+
+These check policy output parity against the previous inference loop, late
+deadlines, elapsed-time phase/IMU updates, timestamp rollover, timing counters,
+and both UF2 architectures. On-device serial measurements are still required
+to establish the achieved control rate.

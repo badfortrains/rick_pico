@@ -5,7 +5,11 @@ else()
     set(USERHOME $ENV{HOME})
 endif()
 set(sdkVersion 2.3.0)
-set(toolchainVersion RISCV_ZCB_RPI_2_2_0_2)
+if(PICO_PLATFORM STREQUAL "rp2350-riscv")
+    set(toolchainVersion RISCV_ZCB_RPI_2_2_0_2)
+else()
+    set(toolchainVersion 15_2_Rel1)
+endif()
 set(picotoolVersion 2.3.0)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
@@ -13,6 +17,7 @@ if (EXISTS ${picoVscode})
 endif()
 # ====================================================================================
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
+set(PICO_PLATFORM rp2350-arm-s CACHE STRING "Pico Platform")
 
 cmake_minimum_required(VERSION 3.13)
 include(pico_sdk_import.cmake)
@@ -36,6 +41,15 @@ pico_sdk_init()
 # Tell CMake we are writing C++
 add_executable(rick_v2_pico 
     main.cpp
+)
+
+# Keep policy accumulation semantics stable while enabling the M33 FPU.
+# Do not enable fast-math or reassociation of the policy's reductions.
+target_compile_options(rick_v2_pico PRIVATE -ffp-contract=off)
+target_compile_definitions(rick_v2_pico PRIVATE
+    # Timing diagnostics must not stall control when a serial reader stops.
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
+    PICO_STDIO_DEADLOCK_TIMEOUT_MS=0
 )
 
 # Enable USB serial output (for debugging) and disable UART

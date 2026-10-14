@@ -11,15 +11,17 @@
 #include "btstack.h"
 #include "hardware/pwm.h"
 #include "hardware/spi.h"
-#include "hardware/timer.h"
+#include "hardware/clocks.h"
 #include "pico/btstack_cyw43.h"
 #include "pico/bootrom.h"
 #include "pico/cyw43_arch.h"
 #include "pico/sha256.h"
 #include "pico/stdlib.h"
+#include "pico/stdio_usb.h"
 #include "pico/util/queue.h"
 
-#include "policy_weights.h"
+#include "policy_inference.h"
+#include "control_timing.h"
 #include "rick_control.h"
 
 // The generated header is the source of truth for the policy interface.
@@ -85,9 +87,7 @@ constexpr float SERVO_MAX_US = 2200.0f;
 float current_obs[OBS_DIM] = {0.0f};
 float target_actions[ACTION_DIM] = {0.0f};
 
-float normalized_obs[OBS_DIM];
-float network_buffer_a[POLICY_MAX_LAYER_DIM];
-float network_buffer_b[POLICY_MAX_LAYER_DIM];
+rick::PolicyNetwork policy_network;
 
 // Madgwick filter state. Identity gives projected gravity [0, 0, -1].  The
 // estimate is initialized once at boot, updated continuously while the robot
@@ -99,7 +99,12 @@ float q2 = 0.0f;
 float q3 = 0.0f;
 constexpr float MADGWICK_BETA = 0.1f;
 
-volatile bool run_control_step = false;
+const uint32_t CONTROL_PERIOD_US =
+    static_cast<uint32_t>(POLICY_CONTROL_DT * 1000000.0f + 0.5f);
+rick::ControlSchedule control_schedule(CONTROL_PERIOD_US);
+rick::SampleClock imu_clock;
+rick::GaitClock gait_clock;
+rick::ControlTiming control_timing;
 uint32_t step_counter = 0;
 float gait_phase = 0.0f;
 
@@ -136,6 +141,15 @@ hci_con_handle_t bluetooth_connection_handle = HCI_CON_HANDLE_INVALID;
 // from each UF2 block, cutting the radio transfer in half. Pages are written
 // sequentially to the inactive RP2350 A/B partition, so the currently running
 // partition is never erased.
+#ifdef __riscv
+constexpr uint32_t FIRMWARE_FAMILY_ID = RP2350_RISCV_FAMILY_ID;
+constexpr const char *FIRMWARE_CPU = "RISC-V (software float)";
+#else
+constexpr uint32_t FIRMWARE_FAMILY_ID = RP2350_ARM_S_FAMILY_ID;
+constexpr const char *FIRMWARE_CPU = "Cortex-M33 (hardware float)";
+static_assert(__ARM_FP & 4, "ARM policy builds require single-precision hardware FP");
+#endif
+
 constexpr uint8_t OTA_PROTOCOL_VERSION = 2;
 constexpr uint8_t OTA_CONTROL_BEGIN = 1;
 constexpr uint8_t OTA_CONTROL_ABORT = 2;
@@ -243,67 +257,6 @@ const uint8_t BLUETOOTH_ADVERTISEMENT_DATA[] = {
 static_assert(
     sizeof(BLUETOOTH_ADVERTISEMENT_DATA) <= 31,
     "Legacy BLE advertising data cannot exceed 31 bytes");
-
-inline float swish(float x) {
-    // Algebraically identical to x * sigmoid(x), without exp overflow.
-    if (x >= 0.0f) {
-        return x / (1.0f + std::exp(-x));
-    }
-    const float exp_x = std::exp(x);
-    return x * exp_x / (1.0f + exp_x);
-}
-
-void normalize_observation(const float *raw_obs, float *output) {
-    for (int index = 0; index < OBS_DIM; ++index) {
-        output[index] =
-            (raw_obs[index] - POLICY_OBS_MEAN[index]) / POLICY_OBS_STD[index];
-    }
-}
-
-void dense_layer(
-    const float *input,
-    const float *weights,
-    const float *biases,
-    float *output,
-    int in_features,
-    int out_features,
-    bool apply_swish) {
-    // Flax Dense kernels are [input, output] in row-major order.
-    for (int output_index = 0; output_index < out_features; ++output_index) {
-        float sum = biases[output_index];
-        for (int input_index = 0; input_index < in_features; ++input_index) {
-            sum += input[input_index] *
-                   weights[input_index * out_features + output_index];
-        }
-        output[output_index] = apply_swish ? swish(sum) : sum;
-    }
-}
-
-void infer_action(const float *raw_obs, float *action) {
-    normalize_observation(raw_obs, normalized_obs);
-
-    const float *layer_input = normalized_obs;
-    float *layer_output = network_buffer_a;
-    for (int layer = 0; layer < POLICY_DENSE_LAYER_COUNT; ++layer) {
-        const bool is_output_layer = layer + 1 == POLICY_DENSE_LAYER_COUNT;
-        dense_layer(
-            layer_input,
-            POLICY_LAYER_KERNELS[layer],
-            POLICY_LAYER_BIASES[layer],
-            layer_output,
-            POLICY_LAYER_IN_DIMS[layer],
-            POLICY_LAYER_OUT_DIMS[layer],
-            !is_output_layer);
-        layer_input = layer_output;
-        layer_output =
-            layer_output == network_buffer_a ? network_buffer_b : network_buffer_a;
-    }
-
-    // Brax deterministic tanh-normal mode is tanh(first half of the logits).
-    for (int index = 0; index < ACTION_DIM; ++index) {
-        action[index] = std::tanh(layer_input[index]);
-    }
-}
 
 void madgwick_update_6dof(
     float gx, float gy, float gz, float ax, float ay, float az, float dt) {
@@ -462,7 +415,7 @@ void init_servos() {
         const uint pin = SERVO_PINS[index];
         gpio_set_function(pin, GPIO_FUNC_PWM);
         const uint slice = pwm_gpio_to_slice_num(pin);
-        pwm_set_clkdiv(slice, 150.0f);  // Pico 2 default: 150 MHz -> 1 us ticks.
+        pwm_set_clkdiv(slice, clock_get_hz(clk_sys) / 1000000.0f);
         pwm_set_wrap(slice, 19999);     // 20 ms / 50 Hz.
         pwm_set_chan_level(
             slice,
@@ -490,8 +443,10 @@ void update_servos(const float *actions) {
 
 void reset_policy_history_and_clock(float previous_action) {
     gait_phase = 0.0f;
+    gait_clock.reset();
+    control_timing.reset(time_us_64());
     step_counter = 0;
-    run_control_step = false;
+    control_schedule.reset(time_us_64());
 
     for (float &value : current_obs) {
         value = 0.0f;
@@ -596,7 +551,7 @@ void apply_control_command(ControlCommand command) {
 
         case ControlCommand::STOP:
             robot_running = false;
-            run_control_step = false;
+            control_schedule.reset(time_us_64());
             control_state = CONTROL_STATE_STOPPED;
             printf("Bluetooth command: stop policy and hold current pose.\n");
             break;
@@ -655,11 +610,28 @@ void append_command_history(const float *new_action) {
     }
 }
 
-void advance_gait_phase() {
-    gait_phase += 2.0f * PI_F * POLICY_STEP_FREQUENCY * POLICY_CONTROL_DT;
-    if (gait_phase >= PI_F) {
-        gait_phase -= 2.0f * PI_F;
+void report_control_timing(uint64_t now_us) {
+    const uint64_t elapsed_us = now_us - control_timing.window_started_us;
+    if (elapsed_us < 1000000 || control_timing.samples == 0) return;
+
+    if (stdio_usb_connected()) {
+        const uint64_t rate_x100 = control_timing.samples * 100000000 / elapsed_us;
+        printf(
+            "Timing: hz=%llu.%02llu infer_us(avg/max)=%llu/%llu "
+            "step_us(max)=%llu dt_us(min/max)=%llu/%llu missed=%llu overruns=%llu\n",
+            static_cast<unsigned long long>(rate_x100 / 100),
+            static_cast<unsigned long long>(rate_x100 % 100),
+            static_cast<unsigned long long>(
+                control_timing.inference_total_us / control_timing.samples),
+            static_cast<unsigned long long>(control_timing.inference_max_us),
+            static_cast<unsigned long long>(control_timing.step_max_us),
+            static_cast<unsigned long long>(control_timing.interval_samples
+                ? control_timing.interval_min_us : 0),
+            static_cast<unsigned long long>(control_timing.interval_max_us),
+            static_cast<unsigned long long>(control_timing.missed_ticks),
+            static_cast<unsigned long long>(control_timing.overruns));
     }
+    control_timing.reset(now_us, true);
 }
 
 uint32_t read_little_endian_u32(const uint8_t *bytes) {
@@ -693,7 +665,7 @@ void stop_robot_for_update() {
     stop_requested = false;
     robot_running = false;
     servo_calibration_active = false;
-    run_control_step = false;
+    control_schedule.reset(time_us_64());
     control_state = CONTROL_STATE_STOPPED;
 
     uint8_t discarded_control;
@@ -805,7 +777,7 @@ void begin_ota_update(const OtaControlPacket &packet) {
     const uint32_t total_bytes = read_little_endian_u32(&packet.bytes[1]);
     const uint32_t family_id = read_little_endian_u32(&packet.bytes[5]);
     if (total_bytes == 0 || total_bytes % OTA_FLASH_PAGE_SIZE != 0 ||
-        family_id != RP2350_RISCV_FAMILY_ID) {
+        family_id != FIRMWARE_FAMILY_ID) {
         ota_fail(OtaError::INVALID_REQUEST);
         return;
     }
@@ -1096,11 +1068,6 @@ void process_ota_abort_request() {
     }
 }
 
-bool control_loop_callback(struct repeating_timer *) {
-    run_control_step = true;
-    return true;
-}
-
 uint16_t bluetooth_read_callback(
     hci_con_handle_t connection_handle,
     uint16_t attribute_handle,
@@ -1151,7 +1118,7 @@ uint16_t bluetooth_read_callback(
 
     if (attribute_handle ==
         ATT_CHARACTERISTIC_7E57A007_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        uint8_t status_bytes[28] = {
+        uint8_t status_bytes[32] = {
             OTA_PROTOCOL_VERSION,
             static_cast<uint8_t>(ota_state),
             static_cast<uint8_t>(ota_error),
@@ -1168,6 +1135,7 @@ uint16_t bluetooth_read_callback(
             &status_bytes[20],
             static_cast<uint32_t>(update_confirmation_result));
         write_little_endian_u32(&status_bytes[24], current_boot_diagnostic);
+        write_little_endian_u32(&status_bytes[28], FIRMWARE_FAMILY_ID);
         return att_read_callback_handle_blob(
             status_bytes,
             sizeof(status_bytes),
@@ -1443,6 +1411,7 @@ bool init_bluetooth() {
 }
 
 int main() {
+    hard_assert(CONTROL_PERIOD_US > 0);
     stdio_init_all();
     initialize_bootrom_support();
     printf(
@@ -1451,6 +1420,9 @@ int main() {
         OBS_DIM,
         ACTION_DIM);
 
+    printf("Controller: %s, clock=%lu Hz, target period=%lu us.\n",
+           FIRMWARE_CPU, static_cast<unsigned long>(clock_get_hz(clk_sys)),
+           static_cast<unsigned long>(CONTROL_PERIOD_US));
     init_imu();
     init_servos();
     queue_init(&control_command_queue, sizeof(uint8_t), 8);
@@ -1468,10 +1440,7 @@ int main() {
         return 1;
     }
 
-    struct repeating_timer timer;
-    const int64_t interval_us =
-        -static_cast<int64_t>(POLICY_CONTROL_DT * 1000000.0f + 0.5f);
-    add_repeating_timer_us(interval_us, control_loop_callback, nullptr, &timer);
+    control_schedule.reset(time_us_64());
 
     float gx;
     float gy;
@@ -1491,27 +1460,36 @@ int main() {
             process_servo_calibration_commands();
         }
 
-        if (run_control_step) {
-            run_control_step = false;
-            if (ota_locks_robot()) {
-                tight_loop_contents();
-                continue;
-            }
-            read_imu(&gx, &gy, &gz, &ax, &ay, &az);
-            madgwick_update_6dof(
-                gx, gy, gz, ax, ay, az, POLICY_CONTROL_DT);
+        const uint64_t now_us = time_us_64();
+        if (ota_locks_robot()) {
+            // Flash updates intentionally suspend sensing. Do not integrate
+            // a single gyro sample over the entire update after it finishes.
+            control_schedule.reset(now_us);
+            imu_clock.reset();
+        } else {
+            uint64_t skipped = 0;
+            if (control_schedule.take(now_us, skipped)) {
+                read_imu(&gx, &gy, &gz, &ax, &ay, &az);
+                const uint64_t sample_us = time_us_64();
+                const float imu_dt = imu_clock.step(sample_us, POLICY_CONTROL_DT);
+                madgwick_update_6dof(gx, gy, gz, ax, ay, az, imu_dt);
 
-            if (robot_running) {
-                update_imu_and_clock_observation(gx, gy, gz);
+                if (robot_running) {
+                    gait_phase = gait_clock.sample(sample_us, POLICY_STEP_FREQUENCY);
+                    update_imu_and_clock_observation(gx, gy, gz);
 
-                infer_action(current_obs, target_actions);
-                update_servos(target_actions);
-                append_command_history(target_actions);
-                advance_gait_phase();
-                ++step_counter;
+                    const uint64_t inference_started_us = time_us_64();
+                    policy_network.infer(current_obs, target_actions);
+                    const uint64_t inference_us = time_us_64() - inference_started_us;
+                    update_servos(target_actions);
+                    append_command_history(target_actions);
+                    ++step_counter;
 
-                // Uncomment for a one-line heartbeat once per second.
-                // if (step_counter % 50 == 0) printf("Policy step %u\n", step_counter);
+                    const uint64_t finished_us = time_us_64();
+                    control_timing.record(now_us, finished_us, inference_us,
+                                          skipped, control_schedule.next_us());
+                    report_control_timing(finished_us);
+                }
             }
         }
         tight_loop_contents();

@@ -1,6 +1,7 @@
 build
 build_bootstrap
 build_sdk23
+build_riscv
 __pycache__/
 *.pyc
 .vscode/*
