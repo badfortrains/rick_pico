@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,15 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(__file__).with_name("policy_weights.h"),
         help="Header to write (default: policy_weights.h beside this script)",
+    )
+    parser.add_argument(
+        "--model-xml",
+        type=Path,
+        help=(
+            "Model XML containing the basic keyframe servo targets. By default, "
+            "use the run's diagnostics/final/assets model when available; "
+            "otherwise export a zero default pose."
+        ),
     )
     return parser.parse_args()
 
@@ -96,6 +106,47 @@ def _float32_array(value: Any, name: str) -> np.ndarray:
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{name} contains NaN or infinity")
     return array
+
+
+def _load_default_pose(
+    checkpoint: Path, action_dim: int, model_xml: Path | None = None
+) -> tuple[np.ndarray, str]:
+    """Read Joystick's basic.ctrl without loading MuJoCo or updating assets."""
+    if model_xml is None:
+        # Supported layouts: <run>/checkpoints/<step> and <run>/<step>.
+        for run_dir in (checkpoint.parent, checkpoint.parent.parent):
+            bundle = run_dir / "diagnostics" / "final"
+            metadata_path = bundle / "metadata.json"
+            if not metadata_path.is_file():
+                continue
+            source = _load_json(metadata_path).get("model_source", {}).get("path")
+            if source:
+                candidate = bundle / "assets" / Path(source).name
+                if candidate.is_file():
+                    model_xml = candidate
+                    break
+
+    if model_xml is None:
+        return np.zeros(action_dim, dtype=np.float32), "No saved model XML; using zero pose"
+
+    model_xml = model_xml.expanduser().resolve()
+    keyframe = ET.parse(model_xml).find("./keyframe/key[@name='basic']")
+    if keyframe is None or "ctrl" not in keyframe.attrib:
+        return (
+            np.zeros(action_dim, dtype=np.float32),
+            f"No basic keyframe ctrl in {model_xml}; using zero pose",
+        )
+
+    pose = _float32_array(
+        np.array(keyframe.attrib["ctrl"].split(), dtype=np.float32),
+        "default pose",
+    )
+    if pose.shape != (action_dim,):
+        raise ValueError(
+            f"Default pose in {model_xml} must contain {action_dim} actuator targets, "
+            f"got {pose.size}"
+        )
+    return pose, f"{model_xml} (basic keyframe ctrl)"
 
 
 def _float_literal(value: float) -> str:
@@ -187,11 +238,16 @@ def _numpy_policy(
     return np.tanh(activations[..., :action_dim])
 
 
-def _build_header(checkpoint: Path) -> tuple[str, int, float]:
+def _build_header(
+    checkpoint: Path, model_xml: Path | None = None
+) -> tuple[str, int, float]:
     network_config = _load_json(checkpoint / "ppo_network_config.json")
     env_config = _load_json(_environment_config_path(checkpoint))
     obs_dim, action_dim, hidden_dims = _validate_configuration(
         network_config, env_config
+    )
+    default_pose, default_pose_source = _load_default_pose(
+        checkpoint, action_dim, model_xml
     )
 
     restored = _restore_checkpoint(checkpoint)
@@ -276,6 +332,9 @@ def _build_header(checkpoint: Path) -> tuple[str, int, float]:
         f"static const float POLICY_GYRO_OBS_SCALE = {_float_literal(env_config['gyro_obs_scale'])};",
         f"static const float POLICY_TARGET_VELOCITY = {_float_literal(env_config['target_velocity'])};",
         f"static const float POLICY_ACTION_SCALE_RAD = {_float_literal(env_config['action_scale'])};",
+        "",
+        f"// Default pose: {default_pose_source}",
+        _format_array("POLICY_DEFAULT_POSE_RAD", default_pose),
         "",
         _format_array("POLICY_OBS_MEAN", obs_mean),
         "",
@@ -368,13 +427,14 @@ def main() -> None:
     if not checkpoint.is_dir():
         raise NotADirectoryError(f"Checkpoint directory not found: {checkpoint}")
 
-    header, parameter_count, max_action_error = _build_header(checkpoint)
+    header, parameter_count, max_action_error = _build_header(checkpoint, args.model_xml)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = output.with_suffix(output.suffix + ".tmp")
     temporary_output.write_text(header, encoding="utf-8")
     temporary_output.replace(output)
     print(f"Wrote {output}")
     print(f"Exported {parameter_count} policy parameters")
+    print(next(line[3:] for line in header.splitlines() if line.startswith("// Default pose:")))
     print(f"Float32 round-trip max action error: {max_action_error:.3g}")
 
 

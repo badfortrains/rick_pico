@@ -410,6 +410,15 @@ void read_imu(
     *az = -physical_ay;
 }
 
+float servo_pulse_width_us(int index, float action, bool use_default_pose = true) {
+    // Exported basic.ctrl targets are relative to calibrated mechanical zero.
+    const float target_rad = (use_default_pose ? POLICY_DEFAULT_POSE_RAD[index] : 0.0f) +
+                             action * POLICY_ACTION_SCALE_RAD;
+    const float pulse_width_us = SERVO_CENTERS_US[index] +
+                                target_rad * SERVO_US_PER_RAD * SERVO_DIRS[index];
+    return std::max(SERVO_MIN_US, std::min(SERVO_MAX_US, pulse_width_us));
+}
+
 void init_servos() {
     for (int index = 0; index < ACTION_DIM; ++index) {
         const uint pin = SERVO_PINS[index];
@@ -420,18 +429,15 @@ void init_servos() {
         pwm_set_chan_level(
             slice,
             pwm_gpio_to_channel(pin),
-            static_cast<uint16_t>(SERVO_CENTERS_US[index]));
+            static_cast<uint16_t>(servo_pulse_width_us(index, 0.0f)));
         pwm_set_enabled(slice, true);
     }
 }
 
-void update_servos(const float *actions) {
-    const float action_range_us = POLICY_ACTION_SCALE_RAD * SERVO_US_PER_RAD;
+void update_servos(const float *actions, bool use_default_pose = true) {
     for (int index = 0; index < ACTION_DIM; ++index) {
-        float pulse_width_us = SERVO_CENTERS_US[index] +
-                               actions[index] * action_range_us * SERVO_DIRS[index];
-        pulse_width_us =
-            std::max(SERVO_MIN_US, std::min(SERVO_MAX_US, pulse_width_us));
+        const float pulse_width_us =
+            servo_pulse_width_us(index, actions[index], use_default_pose);
 
         const uint slice = pwm_gpio_to_slice_num(SERVO_PINS[index]);
         pwm_set_chan_level(
@@ -459,13 +465,13 @@ void reset_policy_history_and_clock(float previous_action) {
     current_obs[TARGET_VELOCITY_OFFSET] = POLICY_TARGET_VELOCITY;
 }
 
-void reset_servos(float action) {
+void reset_servos(float action, bool use_default_pose = true) {
     robot_running = false;
     for (float &target_action : target_actions) {
         target_action = action;
     }
     reset_policy_history_and_clock(action);
-    update_servos(target_actions);
+    update_servos(target_actions, use_default_pose);
 }
 
 void print_servo_centers() {
@@ -500,7 +506,7 @@ void apply_servo_calibration_command(const ServoCalibrationCommand &command) {
     if (!servo_calibration_active) {
         // Enter calibration at the neutral pose, never from a running or held
         // policy pose. Subsequent nudges preserve all current center values.
-        reset_servos(0.0f);
+        reset_servos(0.0f, false);
         servo_calibration_active = true;
     }
 
@@ -509,7 +515,7 @@ void apply_servo_calibration_command(const ServoCalibrationCommand &command) {
         std::min(
             SERVO_MAX_US,
             SERVO_CENTERS_US[command.servo_index] + command.delta_us));
-    update_servos(target_actions);
+    update_servos(target_actions, false);
     control_state = CONTROL_STATE_CALIBRATING;
     printf(
         "Servo %u center adjusted by %+d us to %.0f us.\n",
@@ -1435,7 +1441,7 @@ int main() {
     reset_servos(0.0f);
     control_state = CONTROL_STATE_DEFAULT;
 
-    printf("\nServos at calibrated centers; policy is stopped.\n");
+    printf("\nServos at calibrated default pose; policy is stopped.\n");
     if (!init_bluetooth()) {
         return 1;
     }

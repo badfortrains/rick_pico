@@ -18,6 +18,15 @@ By default this replaces `policy_weights.h` beside the script. The exporter
 checks the PPO configuration, all layer shapes, the Rick observation
 layout, and float32 serialization before writing the header.
 
+The exporter also writes `POLICY_DEFAULT_POSE_RAD` from the model XML's
+`basic` keyframe `ctrl`, matching the training environment's servo targets.
+It locates the saved XML using `diagnostics/final/metadata.json` beside the
+run's `checkpoints` directory (or beside the step directory). To use another
+model, pass `--model-xml /path/to/model.xml`. If no saved XML or `basic.ctrl`
+is available, it exports a zero pose and reports that fallback. Invalid target
+counts and nonfinite values fail the export. Startup, reset, and policy servo
+commands use this generated pose; mechanical-zero calibration bypasses it.
+
 The deployed observation is:
 
 - indices 0--95: twelve previous 8-servo commands, oldest first
@@ -60,7 +69,9 @@ their corresponding shifted indices.
 
 Test with the robot supported off the ground first. The policy was trained
 with `action_scale = 0.40` radians, so the firmware converts a policy action of
-`+/-1` to about `+/-255 us` around each calibrated center. Servos need an
+`+/-1` to about `+/-255 us` around the default pose. The default servo targets
+come from `POLICY_DEFAULT_POSE_RAD` in the exported header, added to each
+calibrated mechanical-zero center with `SERVO_DIRS` applied. Servos need an
 external power supply with a common ground; do not power eight servos from the
 Pico.
 
@@ -79,10 +90,10 @@ Copy `bluetooth.html` to the Android device and open it in Chrome, then:
 2. Tap a control and approve the Android pairing request if one appears.
 3. Use one of the four controls:
    - **Reset to default pos** stops the policy and moves all servos to their
-     calibrated centers.
+     calibrated `basic` keyframe targets.
    - **Reset to full action** stops the policy and sends normalized policy
      action `+1.0` to every servo (the full trained action range around each
-     calibrated center, with `SERVO_DIRS` applied).
+     default target, with `SERVO_DIRS` applied).
    - **Start** resets the gait clock while preserving the IMU orientation
      estimate prewarmed continuously while stopped, then runs the PPO policy
      at 50 Hz.
@@ -104,6 +115,7 @@ The same page includes two calibration tools:
 
 Servo calibration changes live RAM only. Copy the generated declaration into
 `main.cpp` and rebuild/flash the firmware to preserve it across a reboot.
+Finishing calibration returns to the `basic` default pose.
 
 Disconnecting Bluetooth also stops the policy and holds the last pose. Always
 test and calibrate with the robot supported off the ground first.
