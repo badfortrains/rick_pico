@@ -31,9 +31,27 @@ The deployed observation is:
 
 - indices 0--95: twelve previous 8-servo commands, oldest first
 - indices 96--98: body-frame projected gravity
-- indices 99--101: body-frame gyro in rad/s, scaled by 0.25
-- indices 102--103: sine/cosine of the 0.8 Hz gait clock
+- indices 99--101: body-frame gyro in rad/s, scaled by 0.25 (bias corrected for new policies)
+- indices 102--103: sine/cosine of the exported gait clock (currently 1.2 Hz)
 - index 104: target forward velocity (0.068 m/s)
+- indices 105--106, for heading-aware policies: sine/cosine of estimated
+  heading minus the heading captured at **Start**
+
+New training defaults use 107 observations. The exporter writes explicit
+heading/calibration flags and firmware supports both layouts. Older headers
+and checkpoints retain their original 105-value observations and raw gyro.
+Heading comes from the same Madgwick quaternion in simulation and firmware;
+it uses the horizontal projection of the IMU's `-Y` forward axis, with positive
+yaw toward `+X`. No simulation ground-truth heading enters the policy.
+
+For new policies, keep Rick stopped and still for at least two seconds after
+boot (100 samples at 50 Hz) before pressing **Start**. Firmware averages gyro
+bias during stationary windows, rejects movement and acceleration, and freezes
+the correction while walking. Start is ignored until the first calibration
+finishes; USB serial reports completion. Hold the robot still: slow constant
+rotation can resemble sensor bias. Each Start captures a fresh heading reference
+without resetting the settled gravity filter. Heading remains a relative,
+gyro-derived estimate and can accumulate drift over long runs.
 
 The current network is `105 -> 128 -> 128 -> 128 -> 128 -> 16` with SiLU hidden
 activations. Deterministic actions are `tanh` of the first eight outputs. The
@@ -45,6 +63,26 @@ also supports older exported history lengths. Inference streams each row of
 the exported Flax weight matrices contiguously from flash, preserving each
 output's accumulation order. No checkpoint re-export is needed for this
 optimization.
+
+Training now also penalizes lateral velocity and yaw rate averaged over a
+sliding full gait period, before squaring. Fractional weighting of the oldest
+sample covers exactly one period; penalties begin after the window fills.
+Instantaneous penalties remain light. New diagnostic metrics are
+`cycle_sideways_velocity`, `cycle_yaw_rate`, `cycle_window_ready`,
+`cost_cycle_sideways_velocity`, `cost_cycle_yaw_rate`, and
+`estimated_heading_error`. Default cycle penalty weights are 0.5 for lateral
+velocity (normalized by `tracking_sigma`) and 4.0 for yaw rate. These are initial
+settings to evaluate, not an established improvement on the real robot.
+
+When fine-tuning a pre-heading Rick checkpoint, `learning/train_jax_ppo.py`
+automatically appends two zero-weight inputs to both policy and critic and
+extends the normalizer with unit-variance heading channels. Existing outputs
+are preserved for identical old observation inputs. The source checkpoint is
+unchanged; training learns how to use heading. `rick_spot/automate_training.py`
+includes this upgrade module in its VM source bundle. Start from the successful
+`20261015-234303` checkpoint and use the normal `--load-checkpoint-path` workflow.
+The existing `policy_weights.h` remains the currently exported policy until a
+newly trained checkpoint is exported.
 
 ## Servo wiring and calibration
 

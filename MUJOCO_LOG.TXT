@@ -1,0 +1,2 @@
+WARNING Thu Oct 22 09:39:44 2026: Model and executable use different MuJoCo version
+

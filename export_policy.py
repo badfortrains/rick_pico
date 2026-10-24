@@ -208,12 +208,18 @@ def _validate_configuration(
         raise ValueError("Only the PPO 'state' policy observation is supported")
 
     history_length = int(env_config["command_history_length"])
-    expected_obs_dim = history_length * action_dim + 3 + 3 + 2 + 1
+    heading = bool(env_config.get("heading_observation", False))
+    expected_obs_dim = history_length * action_dim + 9 + 2 * heading
     if obs_dim != expected_obs_dim:
         raise ValueError(
             "Rick deployment observation mismatch: expected "
-            f"{history_length} * {action_dim} + 9 = {expected_obs_dim}, got {obs_dim}"
+            f"{history_length} * {action_dim} + 9 + {2 * heading} = {expected_obs_dim}, got {obs_dim}"
         )
+    samples = env_config.get("gyro_bias_calibration_samples", 100)
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples < 1:
+        raise ValueError("gyro_bias_calibration_samples must be a positive integer")
+    if heading and not env_config.get("gyro_bias_calibration", False):
+        raise ValueError("Heading observations require gyro bias calibration")
     return obs_dim, action_dim, hidden_dims
 
 
@@ -326,6 +332,9 @@ def _build_header(
         f"#define POLICY_MAX_LAYER_DIM {max_layer_dim}",
         f"#define POLICY_COMMAND_HISTORY_LENGTH {int(env_config['command_history_length'])}",
         f"#define POLICY_CHECKPOINT_STEP {checkpoint_step}",
+        f"#define POLICY_HEADING_OBSERVATION {int(bool(env_config.get('heading_observation', False)))}",
+        f"#define POLICY_GYRO_BIAS_CALIBRATION {int(bool(env_config.get('gyro_bias_calibration', False)))}",
+        f"#define POLICY_GYRO_BIAS_CALIBRATION_SAMPLES {int(env_config.get('gyro_bias_calibration_samples', 100))}",
         "",
         f"static const float POLICY_CONTROL_DT = {_float_literal(env_config['ctrl_dt'])};",
         f"static const float POLICY_STEP_FREQUENCY = {_float_literal(env_config['step_frequency'])};",

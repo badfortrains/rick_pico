@@ -4,6 +4,7 @@
 #include <random>
 
 #include "control_timing.h"
+#include "heading_control.h"
 #include "policy_inference.h"
 
 // The pre-optimization deployment implementation is the numerical reference.
@@ -32,6 +33,34 @@ static void reference_policy(const float *obs, float *action) {
 }
 
 int main() {
+    // The IMU's -Y axis is forward; positive yaw rotates it toward +X.
+    constexpr float pi = 3.14159265358979323846f;
+    float heading_obs[2];
+    for (float angle : {-3.2f, -0.4f, 0.0f, 1.2f, 3.2f}) {
+        const float heading = rick::heading_from_quat(
+            std::cos(angle / 2), 0, 0, std::sin(angle / 2));
+        rick::relative_heading_observation(heading, 0, heading_obs);
+        assert(std::abs(heading_obs[0] - std::sin(angle)) < 5e-7f);
+        assert(std::abs(heading_obs[1] - std::cos(angle)) < 5e-7f);
+    }
+    rick::relative_heading_observation(-pi + .1f, pi - .1f, heading_obs);
+    assert(std::abs(heading_obs[0] - std::sin(.2f)) < 5e-7f);
+    rick::relative_heading_observation(1.2f, 1.2f, heading_obs);
+    assert(heading_obs[0] == 0 && heading_obs[1] == 1);
+
+    rick::GyroBiasCalibration calibration(100);
+    const float gyro[3] = {.01f, -.02f, .005f}, accel[3] = {0, 0, 1};
+    const float moving[3] = {0, 0, .4f}, accelerating[3] = {0, 0, 1.3f};
+    for (int i = 0; i < 99; ++i) assert(!calibration.observe(gyro, accel, true));
+    assert(!calibration.ready());
+    calibration.observe(moving, accel, true);  // Motion discards partial window.
+    for (int i = 0; i < 99; ++i) assert(!calibration.observe(gyro, accel, true));
+    assert(calibration.observe(gyro, accel, true) && calibration.ready());
+    for (int i = 0; i < 3; ++i) assert(std::abs(calibration.bias(i) - gyro[i]) < 1e-7f);
+    for (int i = 0; i < 110; ++i) calibration.observe(moving, accel, false);
+    for (int i = 0; i < 110; ++i) calibration.observe(gyro, accelerating, true);
+    assert(std::abs(calibration.bias(2) - gyro[2]) < 1e-7f);  // Frozen in motion.
+
     rick::PolicyNetwork network;
     std::mt19937 rng(17);
     std::normal_distribution<float> normal;

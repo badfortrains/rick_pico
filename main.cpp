@@ -22,6 +22,7 @@
 
 #include "policy_inference.h"
 #include "control_timing.h"
+#include "heading_control.h"
 #include "rick_control.h"
 
 // The generated header is the source of truth for the policy interface.
@@ -29,17 +30,28 @@
 #define ACTION_DIM POLICY_ACTION_DIM
 #define HISTORY_LEN POLICY_COMMAND_HISTORY_LENGTH
 #define HISTORY_DIM (HISTORY_LEN * ACTION_DIM)
+// Headers exported before heading support retain their original behavior.
+#ifndef POLICY_HEADING_OBSERVATION
+#define POLICY_HEADING_OBSERVATION 0
+#endif
+#ifndef POLICY_GYRO_BIAS_CALIBRATION
+#define POLICY_GYRO_BIAS_CALIBRATION 0
+#endif
+#ifndef POLICY_GYRO_BIAS_CALIBRATION_SAMPLES
+#define POLICY_GYRO_BIAS_CALIBRATION_SAMPLES 100
+#endif
 
 constexpr int GRAVITY_OFFSET = HISTORY_DIM;
 constexpr int GYRO_OFFSET = GRAVITY_OFFSET + 3;
 constexpr int CLOCK_OFFSET = GYRO_OFFSET + 3;
 constexpr int TARGET_VELOCITY_OFFSET = CLOCK_OFFSET + 2;
+constexpr int HEADING_OFFSET = TARGET_VELOCITY_OFFSET + 1;
 constexpr float PI_F = 3.14159265358979323846f;
 constexpr float RESET_ACTION_FULL = 1.0f;
 
 static_assert(ACTION_DIM == 8, "Rick v2 firmware expects eight servos");
 static_assert(
-    TARGET_VELOCITY_OFFSET + 1 == OBS_DIM,
+    HEADING_OFFSET + 2 * POLICY_HEADING_OBSERVATION == OBS_DIM,
     "Firmware observation layout does not match the exported policy");
 static_assert(
     POLICY_OUTPUT_DIM == 2 * ACTION_DIM,
@@ -107,6 +119,8 @@ rick::GaitClock gait_clock;
 rick::ControlTiming control_timing;
 uint32_t step_counter = 0;
 float gait_phase = 0.0f;
+float heading_reference = 0.0f;
+rick::GyroBiasCalibration gyro_calibration(POLICY_GYRO_BIAS_CALIBRATION_SAMPLES);
 
 enum class ControlCommand : uint8_t {
     RESET_DEFAULT = 0,
@@ -463,6 +477,11 @@ void reset_policy_history_and_clock(float previous_action) {
     current_obs[CLOCK_OFFSET] = 0.0f;
     current_obs[CLOCK_OFFSET + 1] = 1.0f;
     current_obs[TARGET_VELOCITY_OFFSET] = POLICY_TARGET_VELOCITY;
+    heading_reference = rick::heading_from_quat(q0, q1, q2, q3);
+    if constexpr (POLICY_HEADING_OBSERVATION) {
+        rick::relative_heading_observation(heading_reference, heading_reference,
+                                           &current_obs[HEADING_OFFSET]);
+    }
 }
 
 void reset_servos(float action, bool use_default_pose = true) {
@@ -540,9 +559,15 @@ void apply_control_command(ControlCommand command) {
             break;
 
         case ControlCommand::START:
+            if (POLICY_GYRO_BIAS_CALIBRATION && !gyro_calibration.ready()) {
+                printf("Hold Rick still for gyro calibration before Start (%.1f seconds).\n",
+                       POLICY_GYRO_BIAS_CALIBRATION_SAMPLES * POLICY_CONTROL_DT);
+                break;
+            }
+            gyro_calibration.reset_window();
             // Preserve both the held pose in command history and the attitude
-            // estimate prewarmed while stopped.  Only the gait clock and
-            // policy history restart.
+            // estimate prewarmed while stopped. Restart the gait/history and
+            // capture this attitude's heading as the new reference.
             reset_policy_history_and_clock(target_actions[0]);
             for (int history_index = 0; history_index < HISTORY_LEN; ++history_index) {
                 for (int action_index = 0; action_index < ACTION_DIM; ++action_index) {
@@ -600,6 +625,11 @@ void update_imu_and_clock_observation(float gx, float gy, float gz) {
     current_obs[CLOCK_OFFSET] = std::sin(gait_phase);
     current_obs[CLOCK_OFFSET + 1] = std::cos(gait_phase);
     current_obs[TARGET_VELOCITY_OFFSET] = POLICY_TARGET_VELOCITY;
+    if constexpr (POLICY_HEADING_OBSERVATION) {
+        rick::relative_heading_observation(
+            rick::heading_from_quat(q0, q1, q2, q3), heading_reference,
+            &current_obs[HEADING_OFFSET]);
+    }
 
     // joystick.py clips the complete raw observation to [-10, 10].
     for (float &value : current_obs) {
@@ -1478,6 +1508,24 @@ int main() {
                 read_imu(&gx, &gy, &gz, &ax, &ay, &az);
                 const uint64_t sample_us = time_us_64();
                 const float imu_dt = imu_clock.step(sample_us, POLICY_CONTROL_DT);
+                if constexpr (POLICY_GYRO_BIAS_CALIBRATION) {
+                    const float gyro[3] = {gx, gy, gz};
+                    const float accel[3] = {ax, ay, az};
+                    // Pauses/missed samples cannot count as a continuous
+                    // stationary calibration window. Telemetry stays raw.
+                    if (skipped || imu_dt > 1.5f * POLICY_CONTROL_DT) {
+                        gyro_calibration.reset_window();
+                    }
+                    if (gyro_calibration.observe(
+                            gyro, accel, !robot_running && !servo_calibration_active)) {
+                        printf("Gyro bias calibrated: %.5f %.5f %.5f rad/s.\n",
+                               gyro_calibration.bias(0), gyro_calibration.bias(1),
+                               gyro_calibration.bias(2));
+                    }
+                    gx -= gyro_calibration.bias(0);
+                    gy -= gyro_calibration.bias(1);
+                    gz -= gyro_calibration.bias(2);
+                }
                 madgwick_update_6dof(gx, gy, gz, ax, ay, az, imu_dt);
 
                 if (robot_running) {

@@ -110,5 +110,26 @@ class DefaultPoseTest(unittest.TestCase):
         self.assertEqual(error, 0)
 
 
+class HeadingConfigurationTest(unittest.TestCase):
+    def test_legacy_and_heading_layouts_and_mismatches(self):
+        config = {
+            "observation_size": {"shape": [105]}, "action_size": 8,
+            "normalize_observations": True,
+            "network_factory_kwargs": {"policy_hidden_layer_sizes": [128],
+                "activation": "silu", "distribution_type": "tanh_normal"},
+        }
+        env = {"command_history_length": 12}
+        self.assertEqual(export_policy._validate_configuration(config, env)[0], 105)
+        env.update(heading_observation=True, gyro_bias_calibration=True,
+                   gyro_bias_calibration_samples=100)
+        with self.assertRaisesRegex(ValueError, "observation mismatch"):
+            export_policy._validate_configuration(config, env)
+        config["observation_size"]["shape"] = [107]
+        self.assertEqual(export_policy._validate_configuration(config, env)[0], 107)
+        env["gyro_bias_calibration_samples"] = 0
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            export_policy._validate_configuration(config, env)
+
+
 if __name__ == "__main__":
     unittest.main()
