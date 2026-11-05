@@ -46,7 +46,6 @@ constexpr int CLOCK_OFFSET = GYRO_OFFSET + 3;
 constexpr int TARGET_VELOCITY_OFFSET = CLOCK_OFFSET + 2;
 constexpr int HEADING_OFFSET = TARGET_VELOCITY_OFFSET + 1;
 constexpr float PI_F = 3.14159265358979323846f;
-constexpr float RESET_ACTION_FULL = 1.0f;
 
 static_assert(ACTION_DIM == 8, "Rick v2 firmware expects eight servos");
 static_assert(HEADING_OFFSET + 2 * POLICY_HEADING_OBSERVATION == OBS_DIM,
@@ -129,13 +128,13 @@ float heading_reference = 0.0f;
 rick::GyroBiasCalibration gyro_calibration(POLICY_GYRO_BIAS_CALIBRATION_SAMPLES);
 
 enum class ControlCommand : uint8_t {
-    RESET_DEFAULT = 0, RESET_FULL_ACTION = 1, START = 2, STOP = 3,
+    RESET_DEFAULT = 0, RESET_SERVO_CENTERS = 1, START = 2, STOP = 3,
 };
 struct ServoCalibrationCommand { uint8_t servo_index; int16_t delta_us; };
 constexpr uint8_t SERVO_CALIBRATION_FINISH = 0xff;
 constexpr int16_t SERVO_CALIBRATION_MAX_STEP_US = 100;
 constexpr uint8_t CONTROL_STATE_DEFAULT = 0;
-constexpr uint8_t CONTROL_STATE_FULL_ACTION = 1;
+constexpr uint8_t CONTROL_STATE_SERVO_CENTERS = 1;
 constexpr uint8_t CONTROL_STATE_RUNNING = 2;
 constexpr uint8_t CONTROL_STATE_STOPPED = 3;
 constexpr uint8_t CONTROL_STATE_CALIBRATING = 4;
@@ -446,8 +445,9 @@ void apply_control_command(ControlCommand command) {
     switch(command){
     case ControlCommand::RESET_DEFAULT: reset_servos(0);control_state=CONTROL_STATE_DEFAULT;
         printf("Bluetooth command: reset to calibrated default pose.\n");break;
-    case ControlCommand::RESET_FULL_ACTION: reset_servos(RESET_ACTION_FULL);
-        control_state=CONTROL_STATE_FULL_ACTION;printf("Bluetooth command: reset every joint to +1.0 action.\n");break;
+    case ControlCommand::RESET_SERVO_CENTERS: reset_servos(0,false);
+        control_state=CONTROL_STATE_SERVO_CENTERS;
+        printf("Bluetooth command: reset every servo to its raw calibrated center.\n");break;
     case ControlCommand::START:
         if(POLICY_GYRO_BIAS_CALIBRATION&&!gyro_calibration.ready()){
             printf("Hold Rick still for gyro calibration before Start (%.1f seconds).\n",

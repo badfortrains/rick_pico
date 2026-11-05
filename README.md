@@ -109,7 +109,7 @@ during GATT discovery.
 The controller provides:
 
 - reset to the exported default pose;
-- reset all normalized policy actions to `+1.0`;
+- reset every servo to its raw calibrated center pulse;
 - start and stop policy inference;
 - live physical-frame accelerometer and gyro checks;
 - live servo-center calibration;
