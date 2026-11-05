@@ -1,36 +1,35 @@
+#include <Arduino.h>
+#include <BLEAdvertising.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLESecurity.h>
+#include <Wire.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <stdio.h>
 
-#include "pico.h"
-#include "boot/picobin.h"
-#include "boot/picoboot.h"
-#include "boot/uf2.h"
-#include "btstack.h"
-#include "hardware/pwm.h"
-#include "hardware/spi.h"
-#include "hardware/clocks.h"
-#include "pico/btstack_cyw43.h"
-#include "pico/bootrom.h"
-#include "pico/cyw43_arch.h"
-#include "pico/sha256.h"
-#include "pico/stdlib.h"
-#include "pico/stdio_usb.h"
-#include "pico/util/queue.h"
+#include "driver/ledc.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "mbedtls/sha256.h"
 
-#include "policy_inference.h"
 #include "control_timing.h"
 #include "heading_control.h"
-#include "rick_control.h"
+#include "policy_inference.h"
 
-// The generated header is the source of truth for the policy interface.
+// Route diagnostics through native USB CDC instead of the exposed UART0 pins.
+#define printf(...) Serial.printf(__VA_ARGS__)
+
 #define OBS_DIM POLICY_OBS_DIM
 #define ACTION_DIM POLICY_ACTION_DIM
 #define HISTORY_LEN POLICY_COMMAND_HISTORY_LENGTH
 #define HISTORY_DIM (HISTORY_LEN * ACTION_DIM)
-// Headers exported before heading support retain their original behavior.
 #ifndef POLICY_HEADING_OBSERVATION
 #define POLICY_HEADING_OBSERVATION 0
 #endif
@@ -50,65 +49,72 @@ constexpr float PI_F = 3.14159265358979323846f;
 constexpr float RESET_ACTION_FULL = 1.0f;
 
 static_assert(ACTION_DIM == 8, "Rick v2 firmware expects eight servos");
-static_assert(
-    HEADING_OFFSET + 2 * POLICY_HEADING_OBSERVATION == OBS_DIM,
-    "Firmware observation layout does not match the exported policy");
-static_assert(
-    POLICY_OUTPUT_DIM == 2 * ACTION_DIM,
-    "Expected tanh-normal mean and scale outputs");
+static_assert(HEADING_OFFSET + 2 * POLICY_HEADING_OBSERVATION == OBS_DIM,
+              "Firmware observation layout does not match the exported policy");
+static_assert(POLICY_OUTPUT_DIM == 2 * ACTION_DIM,
+              "Expected tanh-normal mean and scale outputs");
 
-// SPI1 and LSM6DSO pins.
-#define SPI_PORT spi1
-#define PIN_MISO 8
-#define PIN_CS 9
-#define PIN_SCK 10
-#define PIN_MOSI 11
+// ESP32-S3-Zero carrier-board wiring.
+constexpr int PIN_STATUS_LED = 21;
+constexpr int PIN_IMU_SDA = 2;
+constexpr int PIN_IMU_SCL = 4;
+constexpr int PIN_IMU_INT1 = 5;
 
-// Policy actuator order is the MuJoCo XML actuator order:
-//   left roll, left upper, left lower, left foot,
-//   right roll, right upper, right lower, right foot.
-// GPIO 12/13 are defaults for the two roll servos newly present in this model.
-// The other six assignments preserve the previous firmware's wiring.
-const uint SERVO_PINS[ACTION_DIM] = {12, 4, 3, 2, 13, 7, 5, 6};
-
-// Verify these signs and centers with the robot supported off the ground.
-const float SERVO_DIRS[ACTION_DIM] = {
-    1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f,
+// MuJoCo actuator order: left roll/upper/lower/foot, then right equivalents.
+constexpr int SERVO_PINS[ACTION_DIM] = {6, 7, 8, 9, 10, 11, 12, 13};
+constexpr bool servo_pins_are_valid() {
+    for (int first = 0; first < ACTION_DIM; ++first) {
+        if (SERVO_PINS[first] == PIN_IMU_SDA ||
+            SERVO_PINS[first] == PIN_IMU_SCL ||
+            SERVO_PINS[first] == PIN_IMU_INT1) return false;
+        for (int second = first + 1; second < ACTION_DIM; ++second) {
+            if (SERVO_PINS[first] == SERVO_PINS[second]) return false;
+        }
+    }
+    return true;
+}
+static_assert(servo_pins_are_valid(), "Servo and IMU GPIO assignments overlap");
+constexpr float SERVO_DIRS[ACTION_DIM] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
 };
-
-// Existing lower-leg calibration values are retained at their shifted indices.
 float SERVO_CENTERS_US[ACTION_DIM] = {
     1595.0f, 1565.0f, 1700.0f, 1500.0f,
     1455.0f, 1545.0f, 1590.0f, 1560.0f,
 };
 
-// A conventional 500--2500 us servo spans approximately pi radians.
-// POLICY_ACTION_SCALE_RAD is generated from the training environment config.
 constexpr float SERVO_US_PER_RAD = 1000.0f / (PI_F / 2.0f);
 constexpr float SERVO_MIN_US = 800.0f;
 constexpr float SERVO_MAX_US = 2200.0f;
+constexpr uint32_t SERVO_FREQUENCY_HZ = 50;
+constexpr uint32_t SERVO_PERIOD_US = 1000000 / SERVO_FREQUENCY_HZ;
+constexpr ledc_timer_bit_t SERVO_PWM_BITS = LEDC_TIMER_14_BIT;
+constexpr uint32_t SERVO_PWM_MAX = (1u << 14) - 1;
 
-// LSM6DSO registers and scale factors: +/-4 g and +/-2000 degrees/second.
-#define CTRL1_XL 0x10
-#define CTRL2_G 0x11
-#define OUTX_L_G 0x22
-#define GYRO_SCALE_RAD_S (0.070f * (PI_F / 180.0f))
-#define ACCEL_SCALE_G (0.122f / 1000.0f)
+// Tokmas ICM-42688-P (LCSC/JLCPCB C54308212), not the TDK device with the
+// same part name. These registers and the 0x36 address are Tokmas-specific.
+constexpr uint8_t IMU_I2C_ADDRESS = 0x36;
+constexpr uint8_t IMU_REG_ACC_DATA_XL = 0x00;
+constexpr uint8_t IMU_REG_CHIP_ID = 0x1f;
+constexpr uint8_t IMU_REG_ACC_CONFIG_0 = 0x20;
+constexpr uint8_t IMU_REG_ACC_CONFIG_1 = 0x21;
+constexpr uint8_t IMU_REG_ACC_CONFIG_2 = 0x22;
+constexpr uint8_t IMU_REG_GYRO_CONFIG_1 = 0x23;
+constexpr uint8_t IMU_REG_GYRO_CONFIG_2 = 0x24;
+constexpr uint8_t IMU_REG_GYRO_CONFIG_3 = 0x25;
+constexpr uint8_t IMU_REG_AGC_CONFIG_1 = 0x2b;
+constexpr uint8_t IMU_REG_ADC_CONFIG = 0xd1;
+constexpr uint8_t IMU_CHIP_ID = 0xa1;
+constexpr uint8_t IMU_ODR_110_HZ = 0x03;
+constexpr uint8_t IMU_ACCEL_RANGE_4G = 0x10;
+constexpr uint8_t IMU_GYRO_RANGE_2000_DPS = 0x60;
+constexpr float GYRO_SCALE_RAD_S = (1.0f / 16.4f) * (PI_F / 180.0f);
+constexpr float ACCEL_SCALE_G = 4.0f / 32768.0f;
 
 float current_obs[OBS_DIM] = {0.0f};
 float target_actions[ACTION_DIM] = {0.0f};
-
 rick::PolicyNetwork policy_network;
 
-// Madgwick filter state. Identity gives projected gravity [0, 0, -1].  The
-// estimate is initialized once at boot, updated continuously while the robot
-// is stopped, and preserved across policy/servo resets so START uses a settled
-// gravity estimate.
-float q0 = 1.0f;
-float q1 = 0.0f;
-float q2 = 0.0f;
-float q3 = 0.0f;
+float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 constexpr float MADGWICK_BETA = 0.1f;
 
 const uint32_t CONTROL_PERIOD_US =
@@ -123,154 +129,84 @@ float heading_reference = 0.0f;
 rick::GyroBiasCalibration gyro_calibration(POLICY_GYRO_BIAS_CALIBRATION_SAMPLES);
 
 enum class ControlCommand : uint8_t {
-    RESET_DEFAULT = 0,
-    RESET_FULL_ACTION = 1,
-    START = 2,
-    STOP = 3,
+    RESET_DEFAULT = 0, RESET_FULL_ACTION = 1, START = 2, STOP = 3,
 };
-
-struct ServoCalibrationCommand {
-    uint8_t servo_index;
-    int16_t delta_us;
-};
-
+struct ServoCalibrationCommand { uint8_t servo_index; int16_t delta_us; };
 constexpr uint8_t SERVO_CALIBRATION_FINISH = 0xff;
 constexpr int16_t SERVO_CALIBRATION_MAX_STEP_US = 100;
-
 constexpr uint8_t CONTROL_STATE_DEFAULT = 0;
 constexpr uint8_t CONTROL_STATE_FULL_ACTION = 1;
 constexpr uint8_t CONTROL_STATE_RUNNING = 2;
 constexpr uint8_t CONTROL_STATE_STOPPED = 3;
 constexpr uint8_t CONTROL_STATE_CALIBRATING = 4;
 
-queue_t control_command_queue;
-queue_t servo_calibration_command_queue;
+QueueHandle_t control_command_queue = nullptr;
+QueueHandle_t servo_calibration_command_queue = nullptr;
 volatile uint8_t control_state = CONTROL_STATE_DEFAULT;
 volatile bool stop_requested = false;
 bool robot_running = false;
 bool servo_calibration_active = false;
-hci_con_handle_t bluetooth_connection_handle = HCI_CON_HANDLE_INVALID;
 
-// BLE OTA protocol. Version 2 receives only the validated 256-byte payload
-// from each UF2 block, cutting the radio transfer in half. Pages are written
-// sequentially to the inactive RP2350 A/B partition, so the currently running
-// partition is never erased.
-#ifdef __riscv
-constexpr uint32_t FIRMWARE_FAMILY_ID = RP2350_RISCV_FAMILY_ID;
-constexpr const char *FIRMWARE_CPU = "RISC-V (software float)";
-#else
-constexpr uint32_t FIRMWARE_FAMILY_ID = RP2350_ARM_S_FAMILY_ID;
-constexpr const char *FIRMWARE_CPU = "Cortex-M33 (hardware float)";
-static_assert(__ARM_FP & 4, "ARM policy builds require single-precision hardware FP");
-#endif
-
-constexpr uint8_t OTA_PROTOCOL_VERSION = 2;
+// Protocol 3 transfers PlatformIO's raw firmware.bin to an inactive OTA slot.
+constexpr uint32_t ESP32_S3_FAMILY_ID = 0x53335045;
+constexpr uint8_t OTA_PROTOCOL_VERSION = 3;
 constexpr uint8_t OTA_CONTROL_BEGIN = 1;
 constexpr uint8_t OTA_CONTROL_ABORT = 2;
 constexpr uint8_t OTA_CONTROL_COMMIT = 3;
 constexpr uint8_t OTA_CONTROL_DIGEST = 4;
-constexpr size_t OTA_SHA256_SIZE = SHA256_RESULT_BYTES;
-constexpr size_t OTA_BEGIN_PACKET_SIZE = 1 + 4 + 4;
+constexpr size_t OTA_SHA256_SIZE = 32;
+constexpr size_t OTA_BEGIN_PACKET_SIZE = 9;
 constexpr size_t OTA_MAX_CONTROL_PACKET_SIZE = 20;
-constexpr size_t OTA_MAX_DIGEST_CHUNK_SIZE = 18;
-// Web Bluetooth caps an attribute value at 512 bytes. Reserve four bytes for
-// the stream offset and accept as many as 508 firmware bytes. Clients with a
-// smaller negotiated MTU fall back to smaller chunks.
 constexpr size_t OTA_MAX_DATA_VALUE_SIZE = 512;
-constexpr size_t OTA_WORKAREA_SIZE = 4096;
-constexpr uint32_t OTA_FLASH_SECTOR_SIZE = 4096;
-constexpr uint32_t OTA_FLASH_PAGE_SIZE = 256;
-constexpr uint8_t OTA_APPLICATION_PARTITION_A = 0;
 
 enum class OtaState : uint8_t {
-    IDLE = 0,
-    RECEIVING = 1,
-    READY = 2,
-    ERROR = 3,
-    REBOOTING = 4,
-    PREPARING = 5,
+    IDLE = 0, RECEIVING = 1, READY = 2, ERROR = 3, REBOOTING = 4, PREPARING = 5,
 };
-
 enum class OtaError : uint8_t {
-    NONE = 0,
-    INVALID_REQUEST = 1,
-    NO_PARTITION = 2,
-    HASH_UNAVAILABLE = 3,
-    INVALID_IMAGE = 4,
-    OUT_OF_ORDER = 5,
-    OUT_OF_RANGE = 6,
-    FLASH_OPERATION = 7,
-    HASH_MISMATCH = 8,
-    DISCONNECTED = 9,
-    IMAGE_REJECTED = 10,
-    REBOOT_FAILED = 11,
+    NONE = 0, INVALID_REQUEST = 1, NO_PARTITION = 2, HASH_UNAVAILABLE = 3,
+    INVALID_IMAGE = 4, OUT_OF_ORDER = 5, OUT_OF_RANGE = 6,
+    FLASH_OPERATION = 7, HASH_MISMATCH = 8, DISCONNECTED = 9,
+    IMAGE_REJECTED = 10, REBOOT_FAILED = 11,
 };
-
 struct OtaControlPacket {
     uint8_t length;
     uint8_t bytes[OTA_MAX_CONTROL_PACKET_SIZE];
 };
-
 struct OtaDataPacket {
     uint16_t length;
     uint8_t bytes[OTA_MAX_DATA_VALUE_SIZE];
 };
 
-queue_t ota_control_queue;
-queue_t ota_data_queue;
+QueueHandle_t ota_control_queue = nullptr;
+QueueHandle_t ota_data_queue = nullptr;
 volatile OtaState ota_state = OtaState::IDLE;
 volatile OtaError ota_error = OtaError::NONE;
 volatile bool ota_abort_requested = false;
-volatile bool bluetooth_ready = false;
-bool pending_update_confirmation = false;
-bool update_confirmation_attempted = false;
-int8_t current_boot_partition = -1;
-uint8_t current_boot_type = 0xff;
-uint8_t current_tbyb_and_update_info = 0;
-int32_t update_confirmation_result = INT32_MIN;
-uint32_t current_boot_diagnostic = 0;
 bool ota_sha_active = false;
 uint8_t ota_expected_sha256[OTA_SHA256_SIZE] = {0};
 uint32_t ota_digest_bytes_received = 0;
-alignas(4) uint8_t ota_page_bytes[OTA_FLASH_PAGE_SIZE] = {0};
-uint32_t ota_page_used = 0;
 uint32_t ota_total_bytes = 0;
 uint32_t ota_bytes_received = 0;
-uint32_t ota_pages_received = 0;
-uint32_t ota_target_partition = 0xff;
-uint32_t ota_target_storage_base = 0;
-uint32_t ota_target_storage_end = 0;
-uint32_t ota_last_erased_sector = UINT32_MAX;
-pico_sha256_state_t ota_sha_state;
-alignas(4) uint8_t ota_workarea[OTA_WORKAREA_SIZE];
+uint32_t ota_chunks_received = 0;
+uint8_t ota_target_partition = 0xff;
+esp_ota_handle_t ota_handle = 0;
+bool ota_writer_active = false;
+const esp_partition_t *ota_partition = nullptr;
+mbedtls_sha256_context ota_sha_state;
 
-#ifdef __riscv
-alignas(4) uint32_t bootrom_stack_words[256];
-bootrom_stack_t bootrom_stack = {
-    bootrom_stack_words,
-    sizeof(bootrom_stack_words),
-};
-#endif
-
-// Bluetooth telemetry uses signed milli-g for acceleration and signed
-// deci-degrees/second for angular velocity, all in the physical sensor frame.
 volatile int16_t imu_telemetry[6] = {0};
+uint32_t imu_read_errors = 0;
+uint32_t imu_consecutive_read_errors = 0;
 
-static btstack_packet_callback_registration_t hci_event_callback_registration;
-static btstack_packet_callback_registration_t sm_event_callback_registration;
+constexpr char SERVICE_UUID[] = "7e57a001-4c91-4d8e-8f2a-7dca6d5a1000";
+constexpr char CONTROL_UUID[] = "7e57a002-4c91-4d8e-8f2a-7dca6d5a1000";
+constexpr char IMU_UUID[] = "7e57a003-4c91-4d8e-8f2a-7dca6d5a1000";
+constexpr char SERVO_UUID[] = "7e57a004-4c91-4d8e-8f2a-7dca6d5a1000";
+constexpr char OTA_CONTROL_UUID[] = "7e57a005-4c91-4d8e-8f2a-7dca6d5a1000";
+constexpr char OTA_DATA_UUID[] = "7e57a006-4c91-4d8e-8f2a-7dca6d5a1000";
+constexpr char OTA_STATUS_UUID[] = "7e57a007-4c91-4d8e-8f2a-7dca6d5a1000";
 
-// 7e57a001-4c91-4d8e-8f2a-7dca6d5a1000, least-significant byte first.
-const uint8_t BLUETOOTH_ADVERTISEMENT_DATA[] = {
-    2, BLUETOOTH_DATA_TYPE_FLAGS, 0x06,
-    8, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
-    'R', 'i', 'c', 'k', 'B', 'o', 't',
-    17, BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS,
-    0x00, 0x10, 0x5a, 0x6d, 0xca, 0x7d, 0x2a, 0x8f,
-    0x8e, 0x4d, 0x91, 0x4c, 0x01, 0xa0, 0x57, 0x7e,
-};
-static_assert(
-    sizeof(BLUETOOTH_ADVERTISEMENT_DATA) <= 31,
-    "Legacy BLE advertising data cannot exceed 31 bytes");
+uint64_t time_us_64() { return static_cast<uint64_t>(esp_timer_get_time()); }
 
 void madgwick_update_6dof(
     float gx, float gy, float gz, float ax, float ay, float az, float dt) {
@@ -278,1274 +214,433 @@ void madgwick_update_6dof(
     float q_dot_2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
     float q_dot_3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
     float q_dot_4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
-
     const float accel_norm_squared = ax * ax + ay * ay + az * az;
     if (accel_norm_squared > 1e-12f) {
         const float accel_recip_norm = 1.0f / std::sqrt(accel_norm_squared);
-        ax *= accel_recip_norm;
-        ay *= accel_recip_norm;
-        az *= accel_recip_norm;
-
-        const float two_q0 = 2.0f * q0;
-        const float two_q1 = 2.0f * q1;
-        const float two_q2 = 2.0f * q2;
-        const float two_q3 = 2.0f * q3;
-        const float four_q0 = 4.0f * q0;
-        const float four_q1 = 4.0f * q1;
+        ax *= accel_recip_norm; ay *= accel_recip_norm; az *= accel_recip_norm;
+        const float two_q0 = 2.0f * q0, two_q1 = 2.0f * q1;
+        const float two_q2 = 2.0f * q2, two_q3 = 2.0f * q3;
+        const float four_q0 = 4.0f * q0, four_q1 = 4.0f * q1;
         const float four_q2 = 4.0f * q2;
-        const float eight_q1 = 8.0f * q1;
-        const float eight_q2 = 8.0f * q2;
-        const float q0_squared = q0 * q0;
-        const float q1_squared = q1 * q1;
-        const float q2_squared = q2 * q2;
-        const float q3_squared = q3 * q3;
-
-        float s0 = four_q0 * q2_squared + two_q2 * ax +
-                   four_q0 * q1_squared - two_q1 * ay;
-        float s1 = four_q1 * q3_squared - two_q3 * ax +
-                   4.0f * q0_squared * q1 - two_q0 * ay - four_q1 +
-                   eight_q1 * q1_squared + eight_q1 * q2_squared +
-                   four_q1 * az;
-        float s2 = 4.0f * q0_squared * q2 + two_q0 * ax +
-                   four_q2 * q3_squared - two_q3 * ay - four_q2 +
-                   eight_q2 * q1_squared + eight_q2 * q2_squared +
-                   four_q2 * az;
-        float s3 = 4.0f * q1_squared * q3 - two_q1 * ax +
-                   4.0f * q2_squared * q3 - two_q2 * ay;
-
-        const float correction_norm_squared =
-            s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
-        if (correction_norm_squared > 1e-12f) {
-            const float correction_recip_norm =
-                1.0f / std::sqrt(correction_norm_squared);
-            s0 *= correction_recip_norm;
-            s1 *= correction_recip_norm;
-            s2 *= correction_recip_norm;
-            s3 *= correction_recip_norm;
-            q_dot_1 -= MADGWICK_BETA * s0;
-            q_dot_2 -= MADGWICK_BETA * s1;
-            q_dot_3 -= MADGWICK_BETA * s2;
-            q_dot_4 -= MADGWICK_BETA * s3;
+        const float eight_q1 = 8.0f * q1, eight_q2 = 8.0f * q2;
+        const float q0s = q0*q0, q1s = q1*q1, q2s = q2*q2, q3s = q3*q3;
+        float s0 = four_q0*q2s + two_q2*ax + four_q0*q1s - two_q1*ay;
+        float s1 = four_q1*q3s - two_q3*ax + 4*q0s*q1 - two_q0*ay -
+                   four_q1 + eight_q1*q1s + eight_q1*q2s + four_q1*az;
+        float s2 = 4*q0s*q2 + two_q0*ax + four_q2*q3s - two_q3*ay -
+                   four_q2 + eight_q2*q1s + eight_q2*q2s + four_q2*az;
+        float s3 = 4*q1s*q3 - two_q1*ax + 4*q2s*q3 - two_q2*ay;
+        const float correction = s0*s0 + s1*s1 + s2*s2 + s3*s3;
+        if (correction > 1e-12f) {
+            const float reciprocal = 1.0f / std::sqrt(correction);
+            s0*=reciprocal; s1*=reciprocal; s2*=reciprocal; s3*=reciprocal;
+            q_dot_1 -= MADGWICK_BETA*s0; q_dot_2 -= MADGWICK_BETA*s1;
+            q_dot_3 -= MADGWICK_BETA*s2; q_dot_4 -= MADGWICK_BETA*s3;
         }
     }
-
-    q0 += q_dot_1 * dt;
-    q1 += q_dot_2 * dt;
-    q2 += q_dot_3 * dt;
-    q3 += q_dot_4 * dt;
-
-    const float quaternion_norm_squared = q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3;
-    if (quaternion_norm_squared > 1e-12f) {
-        const float quaternion_recip_norm =
-            1.0f / std::sqrt(quaternion_norm_squared);
-        q0 *= quaternion_recip_norm;
-        q1 *= quaternion_recip_norm;
-        q2 *= quaternion_recip_norm;
-        q3 *= quaternion_recip_norm;
+    q0 += q_dot_1*dt; q1 += q_dot_2*dt; q2 += q_dot_3*dt; q3 += q_dot_4*dt;
+    const float norm = q0*q0 + q1*q1 + q2*q2 + q3*q3;
+    if (norm > 1e-12f) {
+        const float reciprocal = 1.0f / std::sqrt(norm);
+        q0*=reciprocal; q1*=reciprocal; q2*=reciprocal; q3*=reciprocal;
     } else {
-        q0 = 1.0f;
-        q1 = q2 = q3 = 0.0f;
+        q0 = 1.0f; q1 = q2 = q3 = 0.0f;
     }
 }
 
-void get_local_gravity(float *gravity_out) {
-    // q rotates body vectors into the world frame. joystick.py observes world
-    // gravity rotated by inverse(q), i.e. R(q)^T * [0, 0, -1].
-    gravity_out[0] = 2.0f * (q0 * q2 - q1 * q3);
-    gravity_out[1] = -2.0f * (q0 * q1 + q2 * q3);
-    gravity_out[2] = -(q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3);
+void get_local_gravity(float *out) {
+    out[0] = 2.0f * (q0*q2 - q1*q3);
+    out[1] = -2.0f * (q0*q1 + q2*q3);
+    out[2] = -(q0*q0 - q1*q1 - q2*q2 + q3*q3);
 }
 
-void write_imu_register(uint8_t reg, uint8_t data) {
-    uint8_t buffer[2] = {reg, data};
-    gpio_put(PIN_CS, 0);
-    spi_write_blocking(SPI_PORT, buffer, 2);
-    gpio_put(PIN_CS, 1);
+bool write_imu_register(uint8_t reg, uint8_t data) {
+    Wire.beginTransmission(IMU_I2C_ADDRESS);
+    Wire.write(reg);
+    Wire.write(data);
+    const uint8_t error = Wire.endTransmission(true);
+    if (error != 0) {
+        printf("Tokmas I2C write 0x%02x <- 0x%02x failed (Wire error %u).\n",
+               reg, data, error);
+    }
+    return error == 0;
 }
 
-void init_imu() {
-    spi_init(SPI_PORT, 5000 * 1000);
-    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+bool read_imu_registers(uint8_t first_reg, uint8_t *data, size_t length) {
+    Wire.beginTransmission(IMU_I2C_ADDRESS);
+    Wire.write(first_reg);
+    const uint8_t address_error = Wire.endTransmission(false);
+    if (address_error != 0) {
+        printf("Tokmas I2C read address 0x%02x failed (Wire error %u).\n",
+               first_reg, address_error);
+        return false;
+    }
+    const size_t received = Wire.requestFrom(
+        IMU_I2C_ADDRESS, static_cast<uint8_t>(length), static_cast<uint8_t>(true));
+    if (received != length) {
+        printf("Tokmas I2C short read at 0x%02x: received %u of %u bytes.\n",
+               first_reg, static_cast<unsigned>(received),
+               static_cast<unsigned>(length));
+        while (Wire.available()) Wire.read();
+        return false;
+    }
+    for (size_t index = 0; index < length; ++index) {
+        data[index] = static_cast<uint8_t>(Wire.read());
+    }
+    return true;
+}
 
-    gpio_init(PIN_CS);
-    gpio_set_dir(PIN_CS, GPIO_OUT);
-    gpio_put(PIN_CS, 1);
+bool read_imu_register(uint8_t reg, uint8_t &value) {
+    return read_imu_registers(reg, &value, 1);
+}
 
-    write_imu_register(CTRL1_XL, 0x48);  // 104 Hz, +/-4 g.
-    write_imu_register(CTRL2_G, 0x4C);   // 104 Hz, +/-2000 dps.
-    sleep_ms(50);
+bool init_imu() {
+    Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL, 400000);
+    Wire.setTimeOut(10);
+    pinMode(PIN_IMU_INT1, INPUT);
+    // Tokmas specifies up to 320 ms from power-on before register access.
+    delay(320);
+
+    // Tokmas quick-start initialization sequence (datasheet figure 5).
+    if (!write_imu_register(IMU_REG_AGC_CONFIG_1, 0x01) ||
+        !write_imu_register(IMU_REG_ACC_DATA_XL, 0x73)) {
+        return false;
+    }
+    delay(100);
+    if (!write_imu_register(IMU_REG_ADC_CONFIG, 0x6b) ||
+        !write_imu_register(IMU_REG_ADC_CONFIG, 0x68)) {
+        return false;
+    }
+
+    uint8_t chip_id = 0;
+    if (!read_imu_register(IMU_REG_CHIP_ID, chip_id) || chip_id != IMU_CHIP_ID) {
+        printf("Tokmas IMU chip ID mismatch: expected 0x%02x, read 0x%02x.\n",
+               IMU_CHIP_ID, chip_id);
+        return false;
+    }
+
+    // Enable digital filters. Use 110 Hz with 44 Hz cutoff, +/-4 g, and
+    // +/-2000 dps: the closest Tokmas settings to the old 104 Hz setup.
+    if (!write_imu_register(IMU_REG_ACC_CONFIG_0, 0x01) ||
+        !write_imu_register(IMU_REG_ACC_CONFIG_1,
+                            IMU_ACCEL_RANGE_4G | IMU_ODR_110_HZ) ||
+        !write_imu_register(IMU_REG_ACC_CONFIG_2, 0x00) ||
+        !write_imu_register(IMU_REG_GYRO_CONFIG_1, 0x01) ||
+        !write_imu_register(IMU_REG_GYRO_CONFIG_2,
+                            IMU_GYRO_RANGE_2000_DPS | IMU_ODR_110_HZ) ||
+        !write_imu_register(IMU_REG_GYRO_CONFIG_3, 0x00)) {
+        return false;
+    }
+    delay(20);
+
+    uint8_t accel_config = 0, gyro_config = 0;
+    const bool configured =
+        read_imu_register(IMU_REG_ACC_CONFIG_1, accel_config) &&
+        read_imu_register(IMU_REG_GYRO_CONFIG_2, gyro_config) &&
+        accel_config == (IMU_ACCEL_RANGE_4G | IMU_ODR_110_HZ) &&
+        gyro_config == (IMU_GYRO_RANGE_2000_DPS | IMU_ODR_110_HZ);
+    if (configured) {
+        printf("Tokmas ICM-42688-P ready at I2C address 0x36.\n");
+    } else {
+        printf("Tokmas configuration readback failed: accel=0x%02x gyro=0x%02x.\n",
+               accel_config, gyro_config);
+    }
+    return configured;
 }
 
 int16_t clamp_to_int16(float value) {
-    const float clamped = std::max(-32768.0f, std::min(32767.0f, value));
-    return static_cast<int16_t>(std::lround(clamped));
+    return static_cast<int16_t>(std::lround(
+        std::max(-32768.0f, std::min(32767.0f, value))));
 }
 
-void read_imu(
-    float *gx, float *gy, float *gz, float *ax, float *ay, float *az) {
-    uint8_t reg = OUTX_L_G | 0x80;
+bool read_imu(float *gx, float *gy, float *gz, float *ax, float *ay, float *az) {
     uint8_t buffer[12];
-
-    gpio_put(PIN_CS, 0);
-    spi_write_blocking(SPI_PORT, &reg, 1);
-    spi_read_blocking(SPI_PORT, 0x00, buffer, 12);
-    gpio_put(PIN_CS, 1);
-
-    const int16_t raw_gx = static_cast<int16_t>(buffer[1] << 8 | buffer[0]);
-    const int16_t raw_gy = static_cast<int16_t>(buffer[3] << 8 | buffer[2]);
-    const int16_t raw_gz = static_cast<int16_t>(buffer[5] << 8 | buffer[4]);
-    const int16_t raw_ax = static_cast<int16_t>(buffer[7] << 8 | buffer[6]);
-    const int16_t raw_ay = static_cast<int16_t>(buffer[9] << 8 | buffer[8]);
-    const int16_t raw_az = static_cast<int16_t>(buffer[11] << 8 | buffer[10]);
-
-    const float physical_gx = raw_gx * GYRO_SCALE_RAD_S;
-    const float physical_gy = raw_gy * GYRO_SCALE_RAD_S;
-    const float physical_gz = raw_gz * GYRO_SCALE_RAD_S;
-    const float physical_ax = raw_ax * ACCEL_SCALE_G;
-    const float physical_ay = raw_ay * ACCEL_SCALE_G;
-    const float physical_az = raw_az * ACCEL_SCALE_G;
-
-    imu_telemetry[0] = clamp_to_int16(physical_ax * 1000.0f);
-    imu_telemetry[1] = clamp_to_int16(physical_ay * 1000.0f);
-    imu_telemetry[2] = clamp_to_int16(physical_az * 1000.0f);
-    imu_telemetry[3] = clamp_to_int16(physical_gx * (1800.0f / PI_F));
-    imu_telemetry[4] = clamp_to_int16(physical_gy * (1800.0f / PI_F));
-    imu_telemetry[5] = clamp_to_int16(physical_gz * (1800.0f / PI_F));
-
-    // Sensor: +X right, +Y down, +Z forward.
-    // MuJoCo: +X right, +Y backward, +Z up.
-    *gx = physical_gx;
-    *gy = -physical_gz;
-    *gz = -physical_gy;
-    *ax = physical_ax;
-    *ay = -physical_az;
-    *az = -physical_ay;
+    if (!read_imu_registers(IMU_REG_ACC_DATA_XL, buffer, sizeof(buffer))) return false;
+    const int16_t raw_ax = static_cast<int16_t>(buffer[1]<<8 | buffer[0]);
+    const int16_t raw_ay = static_cast<int16_t>(buffer[3]<<8 | buffer[2]);
+    const int16_t raw_az = static_cast<int16_t>(buffer[5]<<8 | buffer[4]);
+    const int16_t raw_gx = static_cast<int16_t>(buffer[7]<<8 | buffer[6]);
+    const int16_t raw_gy = static_cast<int16_t>(buffer[9]<<8 | buffer[8]);
+    const int16_t raw_gz = static_cast<int16_t>(buffer[11]<<8 | buffer[10]);
+    const float pgx=raw_gx*GYRO_SCALE_RAD_S, pgy=raw_gy*GYRO_SCALE_RAD_S;
+    const float pgz=raw_gz*GYRO_SCALE_RAD_S, pax=raw_ax*ACCEL_SCALE_G;
+    const float pay=raw_ay*ACCEL_SCALE_G, paz=raw_az*ACCEL_SCALE_G;
+    imu_telemetry[0]=clamp_to_int16(pax*1000); imu_telemetry[1]=clamp_to_int16(pay*1000);
+    imu_telemetry[2]=clamp_to_int16(paz*1000);
+    imu_telemetry[3]=clamp_to_int16(pgx*(1800/PI_F));
+    imu_telemetry[4]=clamp_to_int16(pgy*(1800/PI_F));
+    imu_telemetry[5]=clamp_to_int16(pgz*(1800/PI_F));
+    // Preserve the previous sensor-to-robot transform. Confirm the assembled
+    // Tokmas package orientation with Rick Control's IMU axis check.
+    *gx=pgx; *gy=-pgz; *gz=-pgy; *ax=pax; *ay=-paz; *az=-pay;
+    return true;
 }
 
-float servo_pulse_width_us(int index, float action, bool use_default_pose = true) {
-    // Exported basic.ctrl targets are relative to calibrated mechanical zero.
-    const float target_rad = (use_default_pose ? POLICY_DEFAULT_POSE_RAD[index] : 0.0f) +
-                             action * POLICY_ACTION_SCALE_RAD;
-    const float pulse_width_us = SERVO_CENTERS_US[index] +
-                                target_rad * SERVO_US_PER_RAD * SERVO_DIRS[index];
-    return std::max(SERVO_MIN_US, std::min(SERVO_MAX_US, pulse_width_us));
+float servo_pulse_width_us(int index, float action, bool use_default_pose=true) {
+    const float target = (use_default_pose ? POLICY_DEFAULT_POSE_RAD[index] : 0) +
+                         action * POLICY_ACTION_SCALE_RAD;
+    return std::max(SERVO_MIN_US, std::min(SERVO_MAX_US,
+        SERVO_CENTERS_US[index] + target*SERVO_US_PER_RAD*SERVO_DIRS[index]));
 }
-
+uint32_t servo_duty(float pulse_us) {
+    return static_cast<uint32_t>(pulse_us * SERVO_PWM_MAX / SERVO_PERIOD_US + .5f);
+}
 void init_servos() {
-    for (int index = 0; index < ACTION_DIM; ++index) {
-        const uint pin = SERVO_PINS[index];
-        gpio_set_function(pin, GPIO_FUNC_PWM);
-        const uint slice = pwm_gpio_to_slice_num(pin);
-        pwm_set_clkdiv(slice, clock_get_hz(clk_sys) / 1000000.0f);
-        pwm_set_wrap(slice, 19999);     // 20 ms / 50 Hz.
-        pwm_set_chan_level(
-            slice,
-            pwm_gpio_to_channel(pin),
-            static_cast<uint16_t>(servo_pulse_width_us(index, 0.0f)));
-        pwm_set_enabled(slice, true);
+    ledc_timer_config_t timer = {};
+    timer.speed_mode=LEDC_LOW_SPEED_MODE; timer.duty_resolution=SERVO_PWM_BITS;
+    timer.timer_num=LEDC_TIMER_0; timer.freq_hz=SERVO_FREQUENCY_HZ;
+    timer.clk_cfg=LEDC_AUTO_CLK; ESP_ERROR_CHECK(ledc_timer_config(&timer));
+    for (int i=0;i<ACTION_DIM;++i) {
+        ledc_channel_config_t channel = {};
+        channel.gpio_num=SERVO_PINS[i]; channel.speed_mode=LEDC_LOW_SPEED_MODE;
+        channel.channel=static_cast<ledc_channel_t>(i); channel.intr_type=LEDC_INTR_DISABLE;
+        channel.timer_sel=LEDC_TIMER_0; channel.duty=servo_duty(servo_pulse_width_us(i,0));
+        ESP_ERROR_CHECK(ledc_channel_config(&channel));
     }
 }
-
-void update_servos(const float *actions, bool use_default_pose = true) {
-    for (int index = 0; index < ACTION_DIM; ++index) {
-        const float pulse_width_us =
-            servo_pulse_width_us(index, actions[index], use_default_pose);
-
-        const uint slice = pwm_gpio_to_slice_num(SERVO_PINS[index]);
-        pwm_set_chan_level(
-            slice,
-            pwm_gpio_to_channel(SERVO_PINS[index]),
-            static_cast<uint16_t>(pulse_width_us));
+void update_servos(const float *actions, bool use_default_pose=true) {
+    for (int i=0;i<ACTION_DIM;++i) {
+        const auto channel=static_cast<ledc_channel_t>(i);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, channel,
+            servo_duty(servo_pulse_width_us(i,actions[i],use_default_pose)));
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
     }
 }
 
 void reset_policy_history_and_clock(float previous_action) {
-    gait_phase = 0.0f;
-    gait_clock.reset();
-    control_timing.reset(time_us_64());
-    step_counter = 0;
-    control_schedule.reset(time_us_64());
-
-    for (float &value : current_obs) {
-        value = 0.0f;
-    }
-    for (int index = 0; index < HISTORY_DIM; ++index) {
-        current_obs[index] = previous_action;
-    }
-    current_obs[CLOCK_OFFSET] = 0.0f;
-    current_obs[CLOCK_OFFSET + 1] = 1.0f;
-    current_obs[TARGET_VELOCITY_OFFSET] = POLICY_TARGET_VELOCITY;
-    heading_reference = rick::heading_from_quat(q0, q1, q2, q3);
-    if constexpr (POLICY_HEADING_OBSERVATION) {
-        rick::relative_heading_observation(heading_reference, heading_reference,
-                                           &current_obs[HEADING_OFFSET]);
-    }
+    gait_phase=0; gait_clock.reset(); const uint64_t now=time_us_64();
+    control_timing.reset(now); step_counter=0; control_schedule.reset(now);
+    std::fill(std::begin(current_obs),std::end(current_obs),0.0f);
+    std::fill(current_obs,current_obs+HISTORY_DIM,previous_action);
+    current_obs[CLOCK_OFFSET]=0; current_obs[CLOCK_OFFSET+1]=1;
+    current_obs[TARGET_VELOCITY_OFFSET]=POLICY_TARGET_VELOCITY;
+    heading_reference=rick::heading_from_quat(q0,q1,q2,q3);
+    if constexpr(POLICY_HEADING_OBSERVATION)
+        rick::relative_heading_observation(heading_reference,heading_reference,
+                                            &current_obs[HEADING_OFFSET]);
 }
-
-void reset_servos(float action, bool use_default_pose = true) {
-    robot_running = false;
-    for (float &target_action : target_actions) {
-        target_action = action;
-    }
-    reset_policy_history_and_clock(action);
-    update_servos(target_actions, use_default_pose);
+void reset_servos(float action, bool use_default_pose=true) {
+    robot_running=false; std::fill(std::begin(target_actions),std::end(target_actions),action);
+    reset_policy_history_and_clock(action); update_servos(target_actions,use_default_pose);
 }
-
 void print_servo_centers() {
-    printf("\nCopy this calibration into main.cpp:\n");
-    printf("float SERVO_CENTERS_US[ACTION_DIM] = {\n");
-    for (int index = 0; index < ACTION_DIM; ++index) {
-        if (index % 4 == 0) {
-            printf("    ");
-        }
-        printf("%.1ff%s", SERVO_CENTERS_US[index],
-               index + 1 == ACTION_DIM ? "" : ", ");
-        if (index % 4 == 3 || index + 1 == ACTION_DIM) {
-            printf("\n");
-        }
-    }
+    printf("\nCopy this calibration into main.cpp:\nfloat SERVO_CENTERS_US[ACTION_DIM] = {\n");
+    for(int i=0;i<ACTION_DIM;++i){ if(i%4==0)printf("    ");
+        printf("%.1ff%s",SERVO_CENTERS_US[i],i+1==ACTION_DIM?"":", ");
+        if(i%4==3||i+1==ACTION_DIM)printf("\n"); }
     printf("};\n\n");
 }
-
 void apply_servo_calibration_command(const ServoCalibrationCommand &command) {
-    if (command.servo_index == SERVO_CALIBRATION_FINISH) {
-        reset_servos(0.0f);
-        servo_calibration_active = false;
-        control_state = CONTROL_STATE_DEFAULT;
-        print_servo_centers();
-        return;
-    }
-
-    if (command.servo_index >= ACTION_DIM) {
-        return;
-    }
-
-    if (!servo_calibration_active) {
-        // Enter calibration at the neutral pose, never from a running or held
-        // policy pose. Subsequent nudges preserve all current center values.
-        reset_servos(0.0f, false);
-        servo_calibration_active = true;
-    }
-
-    SERVO_CENTERS_US[command.servo_index] = std::max(
-        SERVO_MIN_US,
-        std::min(
-            SERVO_MAX_US,
-            SERVO_CENTERS_US[command.servo_index] + command.delta_us));
-    update_servos(target_actions, false);
-    control_state = CONTROL_STATE_CALIBRATING;
-    printf(
-        "Servo %u center adjusted by %+d us to %.0f us.\n",
-        static_cast<unsigned>(command.servo_index),
-        static_cast<int>(command.delta_us),
-        SERVO_CENTERS_US[command.servo_index]);
+    if(command.servo_index==SERVO_CALIBRATION_FINISH){reset_servos(0);servo_calibration_active=false;
+        control_state=CONTROL_STATE_DEFAULT;print_servo_centers();return;}
+    if(command.servo_index>=ACTION_DIM)return;
+    if(!servo_calibration_active){reset_servos(0,false);servo_calibration_active=true;}
+    SERVO_CENTERS_US[command.servo_index]=std::max(SERVO_MIN_US,std::min(SERVO_MAX_US,
+        SERVO_CENTERS_US[command.servo_index]+command.delta_us));
+    update_servos(target_actions,false);control_state=CONTROL_STATE_CALIBRATING;
+    printf("Servo %u center adjusted by %+d us to %.0f us.\n",command.servo_index,
+           command.delta_us,SERVO_CENTERS_US[command.servo_index]);
 }
-
 void apply_control_command(ControlCommand command) {
-    servo_calibration_active = false;
-    switch (command) {
-        case ControlCommand::RESET_DEFAULT:
-            reset_servos(0.0f);
-            control_state = CONTROL_STATE_DEFAULT;
-            printf("Bluetooth command: reset to calibrated default pose.\n");
-            break;
-
-        case ControlCommand::RESET_FULL_ACTION:
-            reset_servos(RESET_ACTION_FULL);
-            control_state = CONTROL_STATE_FULL_ACTION;
-            printf("Bluetooth command: reset every joint to +1.0 action.\n");
-            break;
-
-        case ControlCommand::START:
-            if (POLICY_GYRO_BIAS_CALIBRATION && !gyro_calibration.ready()) {
-                printf("Hold Rick still for gyro calibration before Start (%.1f seconds).\n",
-                       POLICY_GYRO_BIAS_CALIBRATION_SAMPLES * POLICY_CONTROL_DT);
-                break;
-            }
-            gyro_calibration.reset_window();
-            // Preserve both the held pose in command history and the attitude
-            // estimate prewarmed while stopped. Restart the gait/history and
-            // capture this attitude's heading as the new reference.
-            reset_policy_history_and_clock(target_actions[0]);
-            for (int history_index = 0; history_index < HISTORY_LEN; ++history_index) {
-                for (int action_index = 0; action_index < ACTION_DIM; ++action_index) {
-                    current_obs[history_index * ACTION_DIM + action_index] =
-                        target_actions[action_index];
-                }
-            }
-            robot_running = true;
-            control_state = CONTROL_STATE_RUNNING;
-            printf("Bluetooth command: start policy.\n");
-            break;
-
-        case ControlCommand::STOP:
-            robot_running = false;
-            control_schedule.reset(time_us_64());
-            control_state = CONTROL_STATE_STOPPED;
-            printf("Bluetooth command: stop policy and hold current pose.\n");
-            break;
+    servo_calibration_active=false;
+    switch(command){
+    case ControlCommand::RESET_DEFAULT: reset_servos(0);control_state=CONTROL_STATE_DEFAULT;
+        printf("Bluetooth command: reset to calibrated default pose.\n");break;
+    case ControlCommand::RESET_FULL_ACTION: reset_servos(RESET_ACTION_FULL);
+        control_state=CONTROL_STATE_FULL_ACTION;printf("Bluetooth command: reset every joint to +1.0 action.\n");break;
+    case ControlCommand::START:
+        if(POLICY_GYRO_BIAS_CALIBRATION&&!gyro_calibration.ready()){
+            printf("Hold Rick still for gyro calibration before Start (%.1f seconds).\n",
+                   POLICY_GYRO_BIAS_CALIBRATION_SAMPLES*POLICY_CONTROL_DT);break;}
+        gyro_calibration.reset_window();reset_policy_history_and_clock(target_actions[0]);
+        for(int h=0;h<HISTORY_LEN;++h)for(int a=0;a<ACTION_DIM;++a)
+            current_obs[h*ACTION_DIM+a]=target_actions[a];
+        robot_running=true;control_state=CONTROL_STATE_RUNNING;printf("Bluetooth command: start policy.\n");break;
+    case ControlCommand::STOP: robot_running=false;control_schedule.reset(time_us_64());
+        control_state=CONTROL_STATE_STOPPED;printf("Bluetooth command: stop policy and hold current pose.\n");break;
     }
 }
 
-void process_control_commands() {
-    if (stop_requested) {
-        stop_requested = false;
-        uint8_t discarded_command;
-        while (queue_try_remove(&control_command_queue, &discarded_command)) {
-        }
-        ServoCalibrationCommand discarded_calibration_command;
-        while (queue_try_remove(
-            &servo_calibration_command_queue,
-            &discarded_calibration_command)) {
-        }
-        apply_control_command(ControlCommand::STOP);
-        return;
-    }
-
-    uint8_t command_value;
-    while (queue_try_remove(&control_command_queue, &command_value)) {
-        apply_control_command(static_cast<ControlCommand>(command_value));
-    }
+template<typename T> void drain_queue(QueueHandle_t queue){T item;while(xQueueReceive(queue,&item,0)==pdTRUE){}}
+void process_control_commands(){
+    if(stop_requested){stop_requested=false;drain_queue<uint8_t>(control_command_queue);
+        drain_queue<ServoCalibrationCommand>(servo_calibration_command_queue);
+        apply_control_command(ControlCommand::STOP);return;}
+    uint8_t value;while(xQueueReceive(control_command_queue,&value,0)==pdTRUE)
+        apply_control_command(static_cast<ControlCommand>(value));
 }
-
-void process_servo_calibration_commands() {
-    ServoCalibrationCommand command;
-    while (queue_try_remove(&servo_calibration_command_queue, &command)) {
-        apply_servo_calibration_command(command);
-    }
-}
-
-void update_imu_and_clock_observation(float gx, float gy, float gz) {
+void process_servo_calibration_commands(){ServoCalibrationCommand command;
+    while(xQueueReceive(servo_calibration_command_queue,&command,0)==pdTRUE)
+        apply_servo_calibration_command(command);}
+void update_imu_and_clock_observation(float gx,float gy,float gz){
     get_local_gravity(&current_obs[GRAVITY_OFFSET]);
-    current_obs[GYRO_OFFSET] = POLICY_GYRO_OBS_SCALE * gx;
-    current_obs[GYRO_OFFSET + 1] = POLICY_GYRO_OBS_SCALE * gy;
-    current_obs[GYRO_OFFSET + 2] = POLICY_GYRO_OBS_SCALE * gz;
-    current_obs[CLOCK_OFFSET] = std::sin(gait_phase);
-    current_obs[CLOCK_OFFSET + 1] = std::cos(gait_phase);
-    current_obs[TARGET_VELOCITY_OFFSET] = POLICY_TARGET_VELOCITY;
-    if constexpr (POLICY_HEADING_OBSERVATION) {
-        rick::relative_heading_observation(
-            rick::heading_from_quat(q0, q1, q2, q3), heading_reference,
-            &current_obs[HEADING_OFFSET]);
-    }
-
-    // joystick.py clips the complete raw observation to [-10, 10].
-    for (float &value : current_obs) {
-        value = std::max(-10.0f, std::min(10.0f, value));
-    }
+    current_obs[GYRO_OFFSET]=POLICY_GYRO_OBS_SCALE*gx;
+    current_obs[GYRO_OFFSET+1]=POLICY_GYRO_OBS_SCALE*gy;
+    current_obs[GYRO_OFFSET+2]=POLICY_GYRO_OBS_SCALE*gz;
+    current_obs[CLOCK_OFFSET]=std::sin(gait_phase);current_obs[CLOCK_OFFSET+1]=std::cos(gait_phase);
+    current_obs[TARGET_VELOCITY_OFFSET]=POLICY_TARGET_VELOCITY;
+    if constexpr(POLICY_HEADING_OBSERVATION)rick::relative_heading_observation(
+        rick::heading_from_quat(q0,q1,q2,q3),heading_reference,&current_obs[HEADING_OFFSET]);
+    for(float &value:current_obs)value=std::max(-10.0f,std::min(10.0f,value));
 }
+void append_command_history(const float *action){std::memmove(current_obs,current_obs+ACTION_DIM,
+    (HISTORY_DIM-ACTION_DIM)*sizeof(float));std::memcpy(current_obs+HISTORY_DIM-ACTION_DIM,
+    action,ACTION_DIM*sizeof(float));}
+void report_control_timing(uint64_t now){const uint64_t elapsed=now-control_timing.window_started_us;
+    if(elapsed<1000000||control_timing.samples==0)return;if(Serial){const uint64_t rate=control_timing.samples*100000000/elapsed;
+    printf("Timing: hz=%llu.%02llu infer_us(avg/max)=%llu/%llu step_us(max)=%llu dt_us(min/max)=%llu/%llu missed=%llu overruns=%llu\n",
+        rate/100,rate%100,control_timing.inference_total_us/control_timing.samples,
+        control_timing.inference_max_us,control_timing.step_max_us,
+        control_timing.interval_samples?control_timing.interval_min_us:0,
+        control_timing.interval_max_us,control_timing.missed_ticks,control_timing.overruns);}
+    control_timing.reset(now,true);}
 
-void append_command_history(const float *new_action) {
-    for (int index = 0; index < HISTORY_DIM - ACTION_DIM; ++index) {
-        current_obs[index] = current_obs[index + ACTION_DIM];
-    }
-    for (int index = 0; index < ACTION_DIM; ++index) {
-        current_obs[HISTORY_DIM - ACTION_DIM + index] = new_action[index];
-    }
+uint32_t read_u32(const uint8_t *b){return uint32_t(b[0])|(uint32_t(b[1])<<8)|(uint32_t(b[2])<<16)|(uint32_t(b[3])<<24);}
+void write_u32(uint8_t *b,uint32_t v){b[0]=v;b[1]=v>>8;b[2]=v>>16;b[3]=v>>24;}
+bool ota_locks_robot(){return ota_state==OtaState::PREPARING||ota_state==OtaState::RECEIVING||
+    ota_state==OtaState::READY||ota_state==OtaState::REBOOTING;}
+void ota_cleanup_hash(){if(ota_sha_active){mbedtls_sha256_free(&ota_sha_state);ota_sha_active=false;}}
+void ota_abort_writer(){if(ota_writer_active){esp_ota_abort(ota_handle);ota_writer_active=false;ota_handle=0;}}
+void ota_fail(OtaError error){ota_abort_writer();ota_cleanup_hash();drain_queue<OtaDataPacket>(ota_data_queue);
+    ota_error=error;ota_state=OtaState::ERROR;printf("Firmware update stopped with error %u after %lu bytes.\n",
+    unsigned(error),static_cast<unsigned long>(ota_bytes_received));}
+void ota_reset(){ota_abort_writer();ota_cleanup_hash();drain_queue<OtaDataPacket>(ota_data_queue);
+    ota_digest_bytes_received=ota_total_bytes=ota_bytes_received=ota_chunks_received=0;
+    ota_target_partition=0xff;ota_partition=nullptr;ota_error=OtaError::NONE;ota_state=OtaState::IDLE;}
+void stop_robot_for_update(){stop_requested=false;robot_running=false;servo_calibration_active=false;
+    control_schedule.reset(time_us_64());control_state=CONTROL_STATE_STOPPED;
+    drain_queue<uint8_t>(control_command_queue);drain_queue<ServoCalibrationCommand>(servo_calibration_command_queue);}
+void begin_ota_update(const OtaControlPacket &packet){
+    if(packet.length!=OTA_BEGIN_PACKET_SIZE||(ota_state!=OtaState::IDLE&&ota_state!=OtaState::ERROR)){
+        ota_fail(OtaError::INVALID_REQUEST);return;}
+    const uint32_t size=read_u32(&packet.bytes[1]),family=read_u32(&packet.bytes[5]);
+    ota_partition=esp_ota_get_next_update_partition(nullptr);
+    if(family!=ESP32_S3_FAMILY_ID||size<1024){ota_fail(OtaError::INVALID_IMAGE);return;}
+    if(!ota_partition){ota_fail(OtaError::NO_PARTITION);return;}
+    if(size>ota_partition->size){ota_fail(OtaError::OUT_OF_RANGE);return;}
+    ota_state=OtaState::PREPARING;stop_robot_for_update();drain_queue<OtaDataPacket>(ota_data_queue);
+    ota_total_bytes=size;ota_bytes_received=ota_chunks_received=ota_digest_bytes_received=0;
+    std::memset(ota_expected_sha256,0,sizeof(ota_expected_sha256));
+    ota_target_partition=uint8_t(ota_partition->subtype-ESP_PARTITION_SUBTYPE_APP_OTA_MIN);
+    mbedtls_sha256_init(&ota_sha_state);
+    if(mbedtls_sha256_starts_ret(&ota_sha_state,0)!=0){ota_fail(OtaError::HASH_UNAVAILABLE);return;}
+    ota_sha_active=true;const esp_err_t result=esp_ota_begin(ota_partition,size,&ota_handle);
+    if(result!=ESP_OK){printf("esp_ota_begin failed: %s\n",esp_err_to_name(result));
+        ota_fail(OtaError::FLASH_OPERATION);return;}
+    ota_writer_active=true;
+    printf("Receiving %lu-byte ESP32 image into OTA slot %u.\n",static_cast<unsigned long>(size),ota_target_partition);
 }
-
-void report_control_timing(uint64_t now_us) {
-    const uint64_t elapsed_us = now_us - control_timing.window_started_us;
-    if (elapsed_us < 1000000 || control_timing.samples == 0) return;
-
-    if (stdio_usb_connected()) {
-        const uint64_t rate_x100 = control_timing.samples * 100000000 / elapsed_us;
-        printf(
-            "Timing: hz=%llu.%02llu infer_us(avg/max)=%llu/%llu "
-            "step_us(max)=%llu dt_us(min/max)=%llu/%llu missed=%llu overruns=%llu\n",
-            static_cast<unsigned long long>(rate_x100 / 100),
-            static_cast<unsigned long long>(rate_x100 % 100),
-            static_cast<unsigned long long>(
-                control_timing.inference_total_us / control_timing.samples),
-            static_cast<unsigned long long>(control_timing.inference_max_us),
-            static_cast<unsigned long long>(control_timing.step_max_us),
-            static_cast<unsigned long long>(control_timing.interval_samples
-                ? control_timing.interval_min_us : 0),
-            static_cast<unsigned long long>(control_timing.interval_max_us),
-            static_cast<unsigned long long>(control_timing.missed_ticks),
-            static_cast<unsigned long long>(control_timing.overruns));
-    }
-    control_timing.reset(now_us, true);
+void receive_ota_digest(const OtaControlPacket &packet){
+    if(packet.length<=2||ota_state!=OtaState::PREPARING){ota_fail(OtaError::INVALID_REQUEST);return;}
+    const uint8_t offset=packet.bytes[1];const size_t length=packet.length-2;
+    if(offset!=ota_digest_bytes_received||offset+length>sizeof(ota_expected_sha256)){
+        ota_fail(OtaError::OUT_OF_ORDER);return;}
+    std::memcpy(&ota_expected_sha256[offset],&packet.bytes[2],length);ota_digest_bytes_received+=length;
+    if(ota_digest_bytes_received==sizeof(ota_expected_sha256))ota_state=OtaState::RECEIVING;
 }
-
-uint32_t read_little_endian_u32(const uint8_t *bytes) {
-    return static_cast<uint32_t>(bytes[0]) |
-           (static_cast<uint32_t>(bytes[1]) << 8) |
-           (static_cast<uint32_t>(bytes[2]) << 16) |
-           (static_cast<uint32_t>(bytes[3]) << 24);
-}
-
-void write_little_endian_u32(uint8_t *bytes, uint32_t value) {
-    bytes[0] = static_cast<uint8_t>(value);
-    bytes[1] = static_cast<uint8_t>(value >> 8);
-    bytes[2] = static_cast<uint8_t>(value >> 16);
-    bytes[3] = static_cast<uint8_t>(value >> 24);
-}
-
-bool ota_locks_robot() {
-    return ota_state == OtaState::PREPARING ||
-           ota_state == OtaState::RECEIVING ||
-           ota_state == OtaState::READY ||
-           ota_state == OtaState::REBOOTING;
-}
-
-void drain_ota_data_queue() {
-    OtaDataPacket discarded;
-    while (queue_try_remove(&ota_data_queue, &discarded)) {
-    }
-}
-
-void stop_robot_for_update() {
-    stop_requested = false;
-    robot_running = false;
-    servo_calibration_active = false;
-    control_schedule.reset(time_us_64());
-    control_state = CONTROL_STATE_STOPPED;
-
-    uint8_t discarded_control;
-    while (queue_try_remove(&control_command_queue, &discarded_control)) {
-    }
-    ServoCalibrationCommand discarded_calibration;
-    while (queue_try_remove(
-        &servo_calibration_command_queue, &discarded_calibration)) {
-    }
-}
-
-void ota_cleanup_hash() {
-    if (ota_sha_active) {
-        pico_sha256_cleanup(&ota_sha_state);
-        ota_sha_active = false;
-    }
-}
-
-void ota_fail(OtaError error) {
-    ota_cleanup_hash();
-    drain_ota_data_queue();
-    ota_error = error;
-    ota_state = OtaState::ERROR;
-    printf(
-        "Firmware update stopped with error %u after %lu bytes.\n",
-        static_cast<unsigned>(error),
-        static_cast<unsigned long>(ota_bytes_received));
-}
-
-void ota_reset() {
-    ota_cleanup_hash();
-    drain_ota_data_queue();
-    ota_page_used = 0;
-    ota_digest_bytes_received = 0;
-    ota_total_bytes = 0;
-    ota_bytes_received = 0;
-    ota_pages_received = 0;
-    ota_target_partition = 0xff;
-    ota_target_storage_base = 0;
-    ota_target_storage_end = 0;
-    ota_last_erased_sector = UINT32_MAX;
-    ota_error = OtaError::NONE;
-    ota_state = OtaState::IDLE;
-}
-
-void initialize_bootrom_support() {
-#ifdef __riscv
-    const int stack_result = rom_set_bootrom_stack(&bootrom_stack);
-    if (stack_result != BOOTROM_OK) {
-        printf("Could not install the RP2350 boot ROM stack (%d).\n", stack_result);
-    }
-#endif
-
-    boot_info_t boot_info = {};
-    if (rom_get_boot_info(&boot_info)) {
-        current_boot_partition = boot_info.partition;
-        current_boot_type =
-            static_cast<uint8_t>(rom_get_last_boot_type());
-        current_tbyb_and_update_info = boot_info.tbyb_and_update_info;
-        current_boot_diagnostic = boot_info.boot_diagnostic;
-    }
-
-    pending_update_confirmation =
-        current_boot_type == BOOT_TYPE_FLASH_UPDATE &&
-        (current_tbyb_and_update_info &
-         BOOT_TBYB_AND_UPDATE_FLAG_BUY_PENDING) != 0;
-    printf(
-        "Booted from partition %d (type %u, update info 0x%02x, diagnostic 0x%08lx).\n",
-        current_boot_partition,
-        current_boot_type,
-        current_tbyb_and_update_info,
-        static_cast<unsigned long>(current_boot_diagnostic));
-    if (pending_update_confirmation) {
-        printf("Firmware is running in the try-before-you-buy window.\n");
-    }
-}
-
-void confirm_pending_update_if_ready() {
-    if (!pending_update_confirmation || update_confirmation_attempted ||
-        !bluetooth_ready) {
-        return;
-    }
-
-    update_confirmation_attempted = true;
-    const int result = rom_explicit_buy(ota_workarea, sizeof(ota_workarea));
-    update_confirmation_result = result;
-    if (result == BOOTROM_OK) {
-        pending_update_confirmation = false;
-        boot_info_t boot_info = {};
-        if (rom_get_boot_info(&boot_info)) {
-            current_tbyb_and_update_info = boot_info.tbyb_and_update_info;
-            current_boot_diagnostic = boot_info.boot_diagnostic;
-        }
-        printf("Firmware update accepted; this partition is now permanent.\n");
-    } else {
-        // Do not disable the TBYB watchdog. A failed confirmation must fall
-        // back to the previously working partition.
-        printf("Firmware update confirmation failed (%d); rollback remains armed.\n", result);
-    }
-}
-
-void begin_ota_update(const OtaControlPacket &packet) {
-    if (packet.length != OTA_BEGIN_PACKET_SIZE ||
-        pending_update_confirmation) {
-        ota_fail(OtaError::INVALID_REQUEST);
-        return;
-    }
-
-    const uint32_t total_bytes = read_little_endian_u32(&packet.bytes[1]);
-    const uint32_t family_id = read_little_endian_u32(&packet.bytes[5]);
-    if (total_bytes == 0 || total_bytes % OTA_FLASH_PAGE_SIZE != 0 ||
-        family_id != FIRMWARE_FAMILY_ID) {
-        ota_fail(OtaError::INVALID_REQUEST);
-        return;
-    }
-
-    ota_reset();
-    stop_robot_for_update();
-
-    resident_partition_t target_partition = {};
-    rom_flash_flush_cache();
-    const int partition_result = rom_get_uf2_target_partition(
-        ota_workarea,
-        sizeof(ota_workarea),
-        family_id,
-        &target_partition);
-    if (partition_result < 0) {
-        ota_fail(OtaError::NO_PARTITION);
-        return;
-    }
-
-    const uint16_t first_sector = static_cast<uint16_t>(
-        (target_partition.permissions_and_location &
-         PICOBIN_PARTITION_LOCATION_FIRST_SECTOR_BITS) >>
-        PICOBIN_PARTITION_LOCATION_FIRST_SECTOR_LSB);
-    const uint16_t last_sector = static_cast<uint16_t>(
-        (target_partition.permissions_and_location &
-         PICOBIN_PARTITION_LOCATION_LAST_SECTOR_BITS) >>
-        PICOBIN_PARTITION_LOCATION_LAST_SECTOR_LSB);
-    if (last_sector < first_sector) {
-        ota_fail(OtaError::NO_PARTITION);
-        return;
-    }
-
-    ota_target_storage_base =
-        XIP_BASE + static_cast<uint32_t>(first_sector) * OTA_FLASH_SECTOR_SIZE;
-    ota_target_storage_end =
-        XIP_BASE + (static_cast<uint32_t>(last_sector) + 1) *
-                       OTA_FLASH_SECTOR_SIZE;
-    const uint32_t partition_size =
-        ota_target_storage_end - ota_target_storage_base;
-    const uint32_t page_count = total_bytes / OTA_FLASH_PAGE_SIZE;
-    if (total_bytes > partition_size) {
-        ota_fail(OtaError::OUT_OF_RANGE);
-        return;
-    }
-
-    const int sha_result = pico_sha256_start_blocking(
-        &ota_sha_state, SHA256_BIG_ENDIAN, false);
-    if (sha_result != PICO_OK) {
-        ota_fail(OtaError::HASH_UNAVAILABLE);
-        return;
-    }
-
-    ota_sha_active = true;
-    ota_total_bytes = total_bytes;
-    ota_target_partition = static_cast<uint32_t>(partition_result);
-    std::memset(ota_expected_sha256, 0, sizeof(ota_expected_sha256));
-    ota_error = OtaError::NONE;
-    ota_state = OtaState::PREPARING;
-    printf(
-        "Firmware update prepared: %lu compact pages to partition %d.\n",
-        static_cast<unsigned long>(page_count),
-        partition_result);
-}
-
-void receive_ota_digest(const OtaControlPacket &packet) {
-    if (ota_state != OtaState::PREPARING || packet.length <= 2 ||
-        packet.length > OTA_MAX_CONTROL_PACKET_SIZE) {
-        ota_fail(OtaError::INVALID_REQUEST);
-        return;
-    }
-
-    const uint32_t digest_offset = packet.bytes[1];
-    const uint32_t digest_length = packet.length - 2;
-    if (digest_length > OTA_MAX_DIGEST_CHUNK_SIZE ||
-        digest_offset != ota_digest_bytes_received ||
-        digest_offset + digest_length > sizeof(ota_expected_sha256)) {
-        ota_fail(OtaError::OUT_OF_ORDER);
-        return;
-    }
-
-    std::memcpy(
-        &ota_expected_sha256[digest_offset],
-        &packet.bytes[2],
-        digest_length);
-    ota_digest_bytes_received += digest_length;
-    if (ota_digest_bytes_received == sizeof(ota_expected_sha256)) {
-        ota_state = OtaState::RECEIVING;
-        printf("Firmware update digest received; accepting compact image data.\n");
-    }
-}
-
-bool program_ota_page() {
-    const uint32_t target_address =
-        ota_target_storage_base + ota_pages_received * OTA_FLASH_PAGE_SIZE;
-    if (target_address < ota_target_storage_base ||
-        target_address + OTA_FLASH_PAGE_SIZE > ota_target_storage_end) {
-        ota_fail(OtaError::OUT_OF_RANGE);
-        return false;
-    }
-
-    const uint32_t sector_address =
-        target_address & ~(OTA_FLASH_SECTOR_SIZE - 1);
-    cflash_flags_t flags = {};
-    int result;
-    if (sector_address != ota_last_erased_sector) {
-        flags.flags =
-            (CFLASH_OP_VALUE_ERASE << CFLASH_OP_LSB) |
-            (CFLASH_SECLEVEL_VALUE_SECURE << CFLASH_SECLEVEL_LSB) |
-            (CFLASH_ASPACE_VALUE_STORAGE << CFLASH_ASPACE_LSB);
-        result = rom_flash_op(
-            flags, sector_address, OTA_FLASH_SECTOR_SIZE, nullptr);
-        if (result != BOOTROM_OK) {
-            ota_fail(OtaError::FLASH_OPERATION);
-            return false;
-        }
-        ota_last_erased_sector = sector_address;
-    }
-
-    flags.flags =
-        (CFLASH_OP_VALUE_PROGRAM << CFLASH_OP_LSB) |
-        (CFLASH_SECLEVEL_VALUE_SECURE << CFLASH_SECLEVEL_LSB) |
-        (CFLASH_ASPACE_VALUE_STORAGE << CFLASH_ASPACE_LSB);
-    result = rom_flash_op(
-        flags,
-        target_address,
-        OTA_FLASH_PAGE_SIZE,
-        ota_page_bytes);
-    if (result != BOOTROM_OK) {
-        ota_fail(OtaError::FLASH_OPERATION);
-        return false;
-    }
-
-    ++ota_pages_received;
-    ota_page_used = 0;
-    return true;
-}
-
-void finish_ota_receive() {
-    if (!ota_sha_active || ota_page_used != 0 ||
-        ota_pages_received != ota_total_bytes / OTA_FLASH_PAGE_SIZE) {
-        ota_fail(OtaError::INVALID_IMAGE);
-        return;
-    }
-
-    sha256_result_t actual_sha256;
-    pico_sha256_finish(&ota_sha_state, &actual_sha256);
-    ota_sha_active = false;
-    if (std::memcmp(
-            actual_sha256.bytes,
-            ota_expected_sha256,
-            sizeof(ota_expected_sha256)) != 0) {
-        ota_fail(OtaError::HASH_MISMATCH);
-        return;
-    }
-
-    // The transfer hash above proves that BLE delivered the compact image.
-    // Ask the boot ROM to parse and verify the programmed image too, so READY
-    // means this exact A/B slot is bootable rather than merely byte-complete.
-    rom_flash_flush_cache();
-    const int picked_partition = rom_pick_ab_partition(
-        ota_workarea,
-        sizeof(ota_workarea),
-        OTA_APPLICATION_PARTITION_A,
-        ota_target_storage_base);
-    if (picked_partition < 0 ||
-        static_cast<uint32_t>(picked_partition) != ota_target_partition) {
-        printf(
-            "Boot ROM rejected update partition %lu (selection result %d).\n",
-            static_cast<unsigned long>(ota_target_partition),
-            picked_partition);
-        ota_fail(OtaError::IMAGE_REJECTED);
-        return;
-    }
-
-    ota_state = OtaState::READY;
-    printf("Firmware image verified by SHA-256 and the boot ROM; ready to boot.\n");
-}
-
-void process_ota_data_packet(const OtaDataPacket &packet) {
-    if (ota_state != OtaState::RECEIVING || packet.length <= 4) {
-        return;
-    }
-
-    const uint32_t stream_offset = read_little_endian_u32(packet.bytes);
-    const uint32_t data_length = packet.length - 4;
-    if (stream_offset != ota_bytes_received) {
-        ota_fail(OtaError::OUT_OF_ORDER);
-        return;
-    }
-    if (data_length > ota_total_bytes - ota_bytes_received) {
-        ota_fail(OtaError::OUT_OF_RANGE);
-        return;
-    }
-
-    pico_sha256_update_blocking(
-        &ota_sha_state, &packet.bytes[4], data_length);
-
-    uint32_t source_offset = 0;
-    while (source_offset < data_length &&
-           ota_state == OtaState::RECEIVING) {
-        const uint32_t copy_size = std::min(
-            data_length - source_offset,
-            static_cast<uint32_t>(sizeof(ota_page_bytes)) - ota_page_used);
-        std::memcpy(
-            &ota_page_bytes[ota_page_used],
-            &packet.bytes[4 + source_offset],
-            copy_size);
-        ota_page_used += copy_size;
-        ota_bytes_received += copy_size;
-        source_offset += copy_size;
-
-        if (ota_page_used == sizeof(ota_page_bytes) &&
-            !program_ota_page()) {
-            return;
-        }
-    }
-
-    if (ota_bytes_received == ota_total_bytes) {
-        finish_ota_receive();
-    }
-}
-
-void process_ota_control_packets() {
-    OtaControlPacket packet;
-    while (queue_try_remove(&ota_control_queue, &packet)) {
-        if (packet.length == 0) {
-            continue;
-        }
-
-        switch (packet.bytes[0]) {
-            case OTA_CONTROL_BEGIN:
-                begin_ota_update(packet);
-                break;
-
-            case OTA_CONTROL_ABORT:
-                ota_reset();
-                printf("Firmware update aborted.\n");
-                break;
-
-            case OTA_CONTROL_COMMIT: {
-                if (packet.length != 1 || ota_state != OtaState::READY) {
-                    ota_fail(OtaError::INVALID_REQUEST);
-                    break;
-                }
-                ota_state = OtaState::REBOOTING;
-                printf("Rebooting into the verified firmware image.\n");
-                const int reboot_result = rom_reboot(
-                    REBOOT2_FLAG_REBOOT_TYPE_FLASH_UPDATE |
-                        REBOOT2_FLAG_NO_RETURN_ON_SUCCESS,
-                    1000,
-                    ota_target_storage_base,
-                    0);
-                // NO_RETURN_ON_SUCCESS means reaching here is always failure.
-                printf("Boot ROM refused the firmware reboot (%d).\n", reboot_result);
-                ota_fail(OtaError::REBOOT_FAILED);
-                break;
-            }
-
-            case OTA_CONTROL_DIGEST:
-                receive_ota_digest(packet);
-                break;
-
-            default:
-                ota_fail(OtaError::INVALID_REQUEST);
-                break;
-        }
-    }
-}
-
-void process_ota_data_packets() {
-    OtaDataPacket packet;
-    // Limit work per pass so Bluetooth and the safety stop remain responsive.
-    for (int count = 0;
-         count < 4 && queue_try_remove(&ota_data_queue, &packet);
-         ++count) {
-        process_ota_data_packet(packet);
-    }
-}
-
-void process_ota_abort_request() {
-    if (!ota_abort_requested) {
-        return;
-    }
-    ota_abort_requested = false;
-    if (ota_state == OtaState::PREPARING ||
-        ota_state == OtaState::RECEIVING) {
-        ota_fail(OtaError::DISCONNECTED);
-    }
-}
-
-uint16_t bluetooth_read_callback(
-    hci_con_handle_t connection_handle,
-    uint16_t attribute_handle,
-    uint16_t offset,
-    uint8_t *buffer,
-    uint16_t buffer_size) {
-    UNUSED(connection_handle);
-
-    if (attribute_handle ==
-        ATT_CHARACTERISTIC_7E57A002_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        const uint8_t state = control_state;
-        return att_read_callback_handle_blob(
-            &state, sizeof(state), offset, buffer, buffer_size);
-    }
-
-    if (attribute_handle ==
-        ATT_CHARACTERISTIC_7E57A003_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        uint8_t telemetry_bytes[12];
-        for (int index = 0; index < 6; ++index) {
-            const uint16_t value = static_cast<uint16_t>(imu_telemetry[index]);
-            telemetry_bytes[index * 2] = value & 0xff;
-            telemetry_bytes[index * 2 + 1] = value >> 8;
-        }
-        return att_read_callback_handle_blob(
-            telemetry_bytes,
-            sizeof(telemetry_bytes),
-            offset,
-            buffer,
-            buffer_size);
-    }
-
-    if (attribute_handle ==
-        ATT_CHARACTERISTIC_7E57A004_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        uint8_t center_bytes[ACTION_DIM * 2];
-        for (int index = 0; index < ACTION_DIM; ++index) {
-            const uint16_t center =
-                static_cast<uint16_t>(std::lround(SERVO_CENTERS_US[index]));
-            center_bytes[index * 2] = center & 0xff;
-            center_bytes[index * 2 + 1] = center >> 8;
-        }
-        return att_read_callback_handle_blob(
-            center_bytes,
-            sizeof(center_bytes),
-            offset,
-            buffer,
-            buffer_size);
-    }
-
-    if (attribute_handle ==
-        ATT_CHARACTERISTIC_7E57A007_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        uint8_t status_bytes[32] = {
-            OTA_PROTOCOL_VERSION,
-            static_cast<uint8_t>(ota_state),
-            static_cast<uint8_t>(ota_error),
-            static_cast<uint8_t>(ota_target_partition),
-        };
-        write_little_endian_u32(&status_bytes[4], ota_bytes_received);
-        write_little_endian_u32(&status_bytes[8], ota_total_bytes);
-        write_little_endian_u32(&status_bytes[12], ota_pages_received);
-        status_bytes[16] = static_cast<uint8_t>(current_boot_partition);
-        status_bytes[17] = current_boot_type;
-        status_bytes[18] = current_tbyb_and_update_info;
-        status_bytes[19] = update_confirmation_attempted ? 1 : 0;
-        write_little_endian_u32(
-            &status_bytes[20],
-            static_cast<uint32_t>(update_confirmation_result));
-        write_little_endian_u32(&status_bytes[24], current_boot_diagnostic);
-        write_little_endian_u32(&status_bytes[28], FIRMWARE_FAMILY_ID);
-        return att_read_callback_handle_blob(
-            status_bytes,
-            sizeof(status_bytes),
-            offset,
-            buffer,
-            buffer_size);
-    }
-
-    return 0;
-}
-
-int bluetooth_write_callback(
-    hci_con_handle_t connection_handle,
-    uint16_t attribute_handle,
-    uint16_t transaction_mode,
-    uint16_t offset,
-    uint8_t *buffer,
-    uint16_t buffer_size) {
-    UNUSED(connection_handle);
-
-    if (transaction_mode != ATT_TRANSACTION_MODE_NONE) {
-        return ATT_ERROR_REQUEST_NOT_SUPPORTED;
-    }
-    if (offset != 0) {
-        return ATT_ERROR_INVALID_OFFSET;
-    }
-
-    if (attribute_handle ==
-        ATT_CHARACTERISTIC_7E57A005_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        if (buffer_size == 0 || buffer_size > OTA_MAX_CONTROL_PACKET_SIZE) {
-            return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
-        }
-
-        const bool valid_size =
-            (buffer[0] == OTA_CONTROL_BEGIN &&
-             buffer_size == OTA_BEGIN_PACKET_SIZE) ||
-            (buffer[0] == OTA_CONTROL_DIGEST &&
-             buffer_size > 2) ||
-            ((buffer[0] == OTA_CONTROL_ABORT ||
-              buffer[0] == OTA_CONTROL_COMMIT) &&
-             buffer_size == 1);
-        if (!valid_size) {
-            return ATT_ERROR_VALUE_NOT_ALLOWED;
-        }
-
-        OtaControlPacket packet = {};
-        packet.length = static_cast<uint8_t>(buffer_size);
-        std::memcpy(packet.bytes, buffer, buffer_size);
-        if (!queue_try_add(&ota_control_queue, &packet)) {
-            return ATT_ERROR_INSUFFICIENT_RESOURCES;
-        }
-        return 0;
-    }
-
-    if (attribute_handle ==
-        ATT_CHARACTERISTIC_7E57A006_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        if (buffer_size <= 4 || buffer_size > OTA_MAX_DATA_VALUE_SIZE) {
-            return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
-        }
-        if (ota_state != OtaState::RECEIVING) {
-            return ATT_ERROR_WRITE_REQUEST_REJECTED;
-        }
-
-        OtaDataPacket packet = {};
-        packet.length = buffer_size;
-        std::memcpy(packet.bytes, buffer, buffer_size);
-        if (!queue_try_add(&ota_data_queue, &packet)) {
-            return ATT_ERROR_INSUFFICIENT_RESOURCES;
-        }
-        return 0;
-    }
-
-    if (attribute_handle ==
-        ATT_CHARACTERISTIC_7E57A002_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        if (ota_locks_robot()) {
-            return ATT_ERROR_WRITE_REQUEST_REJECTED;
-        }
-        if (buffer_size != 1) {
-            return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
-        }
-        if (buffer[0] > static_cast<uint8_t>(ControlCommand::STOP)) {
-            return ATT_ERROR_REQUEST_NOT_SUPPORTED;
-        }
-
-        if (buffer[0] == static_cast<uint8_t>(ControlCommand::STOP)) {
-            // This flag is observed before the command queue so Stop cannot be
-            // delayed behind other commands.
-            stop_requested = true;
-            return 0;
-        }
-        if (!queue_try_add(&control_command_queue, buffer)) {
-            return ATT_ERROR_INSUFFICIENT_RESOURCES;
-        }
-        return 0;
-    }
-
-    if (attribute_handle ==
-        ATT_CHARACTERISTIC_7E57A004_4C91_4D8E_8F2A_7DCA6D5A1000_01_VALUE_HANDLE) {
-        if (ota_locks_robot()) {
-            return ATT_ERROR_WRITE_REQUEST_REJECTED;
-        }
-        if (buffer_size != 3) {
-            return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
-        }
-
-        int32_t delta_us =
-            static_cast<int32_t>(buffer[1] | (buffer[2] << 8));
-        if ((delta_us & 0x8000) != 0) {
-            delta_us -= 0x10000;
-        }
-
-        const bool finish = buffer[0] == SERVO_CALIBRATION_FINISH;
-        if ((finish && delta_us != 0) ||
-            (!finish &&
-             (buffer[0] >= ACTION_DIM || delta_us == 0 ||
-              delta_us < -SERVO_CALIBRATION_MAX_STEP_US ||
-              delta_us > SERVO_CALIBRATION_MAX_STEP_US))) {
-            return ATT_ERROR_REQUEST_NOT_SUPPORTED;
-        }
-
-        const ServoCalibrationCommand command = {
-            buffer[0], static_cast<int16_t>(delta_us)};
-        if (!queue_try_add(&servo_calibration_command_queue, &command)) {
-            return ATT_ERROR_INSUFFICIENT_RESOURCES;
-        }
-        return 0;
-    }
-
-    return 0;
-}
-
-void start_bluetooth_advertising() {
-    constexpr uint16_t ADVERTISEMENT_INTERVAL = 0x00a0;  // 100 ms.
-    bd_addr_t null_address = {0};
-    gap_advertisements_set_params(
-        ADVERTISEMENT_INTERVAL,
-        ADVERTISEMENT_INTERVAL,
-        0,
-        0,
-        null_address,
-        0x07,
-        0x00);
-    gap_advertisements_set_data(
-        sizeof(BLUETOOTH_ADVERTISEMENT_DATA),
-        const_cast<uint8_t *>(BLUETOOTH_ADVERTISEMENT_DATA));
-    gap_advertisements_enable(1);
-}
-
-void bluetooth_packet_handler(
-    uint8_t packet_type,
-    uint16_t channel,
-    uint8_t *packet,
-    uint16_t size) {
-    UNUSED(channel);
-    UNUSED(size);
-
-    if (packet_type != HCI_EVENT_PACKET) {
-        return;
-    }
-
-    switch (hci_event_packet_get_type(packet)) {
-        case BTSTACK_EVENT_STATE:
-            if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
-                bluetooth_ready = true;
-                bd_addr_t local_address;
-                gap_local_bd_addr(local_address);
-                printf(
-                    "Bluetooth ready as RickBot (%s). Waiting for Android.\n",
-                    bd_addr_to_str(local_address));
-                start_bluetooth_advertising();
-            }
-            break;
-
-        case HCI_EVENT_META_GAP:
-            if (hci_event_gap_meta_get_subevent_code(packet) ==
-                GAP_SUBEVENT_LE_CONNECTION_COMPLETE) {
-                bluetooth_connection_handle =
-                    gap_subevent_le_connection_complete_get_connection_handle(packet);
-                const uint16_t connection_interval =
-                    gap_subevent_le_connection_complete_get_conn_interval(packet);
-                // Android Web Bluetooth pairs transparently when an encrypted
-                // characteristic is first written. Starting pairing here can
-                // race Android's GATT discovery and leave its first read
-                // pending until the connection times out.
-                printf(
-                    "Bluetooth connected at %u.%02u ms; requesting 15 ms for OTA.\n",
-                    connection_interval * 125 / 100,
-                    25 * (connection_interval & 3));
-                const int update_result = gap_request_connection_parameter_update(
-                    bluetooth_connection_handle,
-                    12,
-                    12,
-                    0,
-                    0x0048);
-                if (update_result != ERROR_CODE_SUCCESS) {
-                    printf(
-                        "Bluetooth connection interval request failed (%d).\n",
-                        update_result);
-                }
-            }
-            break;
-
-        case HCI_EVENT_LE_META:
-            if (hci_event_le_meta_get_subevent_code(packet) ==
-                HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE &&
-                hci_subevent_le_connection_update_complete_get_connection_handle(packet) ==
-                    bluetooth_connection_handle) {
-                const uint8_t status =
-                    hci_subevent_le_connection_update_complete_get_status(packet);
-                const uint16_t connection_interval =
-                    hci_subevent_le_connection_update_complete_get_conn_interval(packet);
-                printf(
-                    "Bluetooth connection update status 0x%02x: %u.%02u ms, latency %u.\n",
-                    status,
-                    connection_interval * 125 / 100,
-                    25 * (connection_interval & 3),
-                    hci_subevent_le_connection_update_complete_get_conn_latency(packet));
-            }
-            break;
-
-        case HCI_EVENT_DISCONNECTION_COMPLETE:
-            if (hci_event_disconnection_complete_get_connection_handle(packet) ==
-                bluetooth_connection_handle) {
-                bluetooth_connection_handle = HCI_CON_HANDLE_INVALID;
-                stop_requested = true;
-                ota_abort_requested = true;
-                printf("Bluetooth disconnected; stopping policy.\n");
-                gap_advertisements_enable(1);
-            }
-            break;
-
-        case SM_EVENT_JUST_WORKS_REQUEST:
-            sm_just_works_confirm(
-                sm_event_just_works_request_get_handle(packet));
-            break;
-
-        case SM_EVENT_PAIRING_COMPLETE:
-            if (sm_event_pairing_complete_get_status(packet) == ERROR_CODE_SUCCESS) {
-                printf("Bluetooth pairing complete.\n");
-            } else {
-                stop_requested = true;
-                printf(
-                    "Bluetooth pairing failed (status 0x%02x).\n",
-                    sm_event_pairing_complete_get_status(packet));
-            }
-            break;
-
-        default:
-            break;
-    }
-}
-
-bool init_bluetooth() {
-    if (cyw43_arch_init() != 0) {
-        printf("Failed to initialize the Pico 2 W wireless chip.\n");
-        return false;
-    }
-
-    l2cap_init();
-    sm_init();
-    sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
-    sm_set_authentication_requirements(
-        SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
-    att_server_init(profile_data, bluetooth_read_callback, bluetooth_write_callback);
-
-    hci_event_callback_registration.callback = bluetooth_packet_handler;
-    hci_add_event_handler(&hci_event_callback_registration);
-    sm_event_callback_registration.callback = bluetooth_packet_handler;
-    sm_add_event_handler(&sm_event_callback_registration);
-
-    hci_power_control(HCI_POWER_ON);
-    return true;
-}
-
-int main() {
-    hard_assert(CONTROL_PERIOD_US > 0);
-    stdio_init_all();
-    initialize_bootrom_support();
-    printf(
-        "Starting Rick Pico policy checkpoint %u (%d obs, %d actions)...\n",
-        static_cast<unsigned>(POLICY_CHECKPOINT_STEP),
-        OBS_DIM,
-        ACTION_DIM);
-
-    printf("Controller: %s, clock=%lu Hz, target period=%lu us.\n",
-           FIRMWARE_CPU, static_cast<unsigned long>(clock_get_hz(clk_sys)),
-           static_cast<unsigned long>(CONTROL_PERIOD_US));
-    init_imu();
-    init_servos();
-    queue_init(&control_command_queue, sizeof(uint8_t), 8);
-    queue_init(
-        &servo_calibration_command_queue,
-        sizeof(ServoCalibrationCommand),
-        8);
-    queue_init(&ota_control_queue, sizeof(OtaControlPacket), 4);
-    queue_init(&ota_data_queue, sizeof(OtaDataPacket), 8);
-    reset_servos(0.0f);
-    control_state = CONTROL_STATE_DEFAULT;
-
-    printf("\nServos at calibrated default pose; policy is stopped.\n");
-    if (!init_bluetooth()) {
-        return 1;
-    }
-
-    control_schedule.reset(time_us_64());
-
-    float gx;
-    float gy;
-    float gz;
-    float ax;
-    float ay;
-    float az;
-
-    while (true) {
-        confirm_pending_update_if_ready();
-        process_ota_abort_request();
-        process_ota_control_packets();
-        process_ota_data_packets();
-
-        if (!ota_locks_robot()) {
-            process_control_commands();
-            process_servo_calibration_commands();
-        }
-
-        const uint64_t now_us = time_us_64();
-        if (ota_locks_robot()) {
-            // Flash updates intentionally suspend sensing. Do not integrate
-            // a single gyro sample over the entire update after it finishes.
-            control_schedule.reset(now_us);
-            imu_clock.reset();
-        } else {
-            uint64_t skipped = 0;
-            if (control_schedule.take(now_us, skipped)) {
-                read_imu(&gx, &gy, &gz, &ax, &ay, &az);
-                const uint64_t sample_us = time_us_64();
-                const float imu_dt = imu_clock.step(sample_us, POLICY_CONTROL_DT);
-                if constexpr (POLICY_GYRO_BIAS_CALIBRATION) {
-                    const float gyro[3] = {gx, gy, gz};
-                    const float accel[3] = {ax, ay, az};
-                    // Pauses/missed samples cannot count as a continuous
-                    // stationary calibration window. Telemetry stays raw.
-                    if (skipped || imu_dt > 1.5f * POLICY_CONTROL_DT) {
-                        gyro_calibration.reset_window();
-                    }
-                    if (gyro_calibration.observe(
-                            gyro, accel, !robot_running && !servo_calibration_active)) {
-                        printf("Gyro bias calibrated: %.5f %.5f %.5f rad/s.\n",
-                               gyro_calibration.bias(0), gyro_calibration.bias(1),
-                               gyro_calibration.bias(2));
-                    }
-                    gx -= gyro_calibration.bias(0);
-                    gy -= gyro_calibration.bias(1);
-                    gz -= gyro_calibration.bias(2);
-                }
-                madgwick_update_6dof(gx, gy, gz, ax, ay, az, imu_dt);
-
-                if (robot_running) {
-                    gait_phase = gait_clock.sample(sample_us, POLICY_STEP_FREQUENCY);
-                    update_imu_and_clock_observation(gx, gy, gz);
-
-                    const uint64_t inference_started_us = time_us_64();
-                    policy_network.infer(current_obs, target_actions);
-                    const uint64_t inference_us = time_us_64() - inference_started_us;
-                    update_servos(target_actions);
-                    append_command_history(target_actions);
-                    ++step_counter;
-
-                    const uint64_t finished_us = time_us_64();
-                    control_timing.record(now_us, finished_us, inference_us,
-                                          skipped, control_schedule.next_us());
-                    report_control_timing(finished_us);
-                }
-            }
-        }
-        tight_loop_contents();
-    }
-}
+void finish_ota_receive(){uint8_t digest[OTA_SHA256_SIZE];
+    if(!ota_sha_active||mbedtls_sha256_finish_ret(&ota_sha_state,digest)!=0){ota_fail(OtaError::HASH_UNAVAILABLE);return;}
+    ota_cleanup_hash();if(std::memcmp(digest,ota_expected_sha256,sizeof(digest))!=0){ota_fail(OtaError::HASH_MISMATCH);return;}
+    const esp_err_t result=esp_ota_end(ota_handle);ota_writer_active=false;ota_handle=0;
+    if(result!=ESP_OK){printf("esp_ota_end rejected image: %s\n",esp_err_to_name(result));
+        ota_fail(OtaError::IMAGE_REJECTED);return;}
+    ota_state=OtaState::READY;printf("Firmware image verified. Waiting for commit.\n");}
+void process_ota_data_packet(const OtaDataPacket &packet){
+    if(ota_state!=OtaState::RECEIVING||packet.length<=4){ota_fail(OtaError::INVALID_REQUEST);return;}
+    const uint32_t offset=read_u32(packet.bytes);const size_t length=packet.length-4;
+    if(offset!=ota_bytes_received){ota_fail(OtaError::OUT_OF_ORDER);return;}
+    if(length>ota_total_bytes-ota_bytes_received){ota_fail(OtaError::OUT_OF_RANGE);return;}
+    const uint8_t *data=&packet.bytes[4];if(offset==0&&data[0]!=0xe9){ota_fail(OtaError::INVALID_IMAGE);return;}
+    if(esp_ota_write(ota_handle,data,length)!=ESP_OK){ota_fail(OtaError::FLASH_OPERATION);return;}
+    if(mbedtls_sha256_update_ret(&ota_sha_state,data,length)!=0){ota_fail(OtaError::HASH_UNAVAILABLE);return;}
+    ota_bytes_received+=length;++ota_chunks_received;if(ota_bytes_received==ota_total_bytes)finish_ota_receive();}
+void process_ota_control_packets(){OtaControlPacket packet;while(xQueueReceive(ota_control_queue,&packet,0)==pdTRUE){
+    if(!packet.length)continue;switch(packet.bytes[0]){
+    case OTA_CONTROL_BEGIN:begin_ota_update(packet);break;
+    case OTA_CONTROL_ABORT:ota_reset();printf("Firmware update aborted.\n");break;
+    case OTA_CONTROL_COMMIT:{if(packet.length!=1||ota_state!=OtaState::READY||!ota_partition){ota_fail(OtaError::INVALID_REQUEST);break;}
+        const esp_err_t result=esp_ota_set_boot_partition(ota_partition);if(result!=ESP_OK){
+            printf("Could not select OTA boot partition: %s\n",esp_err_to_name(result));ota_fail(OtaError::REBOOT_FAILED);break;}
+        ota_state=OtaState::REBOOTING;printf("Rebooting into verified firmware.\n");delay(150);esp_restart();break;}
+    case OTA_CONTROL_DIGEST:receive_ota_digest(packet);break;
+    default:ota_fail(OtaError::INVALID_REQUEST);break;}}}
+void process_ota_data_packets(){OtaDataPacket packet;for(int i=0;i<4&&xQueueReceive(ota_data_queue,&packet,0)==pdTRUE;++i)
+    process_ota_data_packet(packet);}
+void process_ota_abort_request(){if(!ota_abort_requested)return;ota_abort_requested=false;
+    if(ota_state==OtaState::PREPARING||ota_state==OtaState::RECEIVING)ota_fail(OtaError::DISCONNECTED);}
+
+void set_value(BLECharacteristic *characteristic,const uint8_t *data,size_t length){
+    characteristic->setValue(const_cast<uint8_t*>(data),length);}
+class RickCharacteristicCallbacks:public BLECharacteristicCallbacks{
+public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS};
+    explicit RickCharacteristicCallbacks(Kind kind):kind_(kind){}
+    void onRead(BLECharacteristic *c)override{
+        if(kind_==Kind::CONTROL){const uint8_t state=control_state;set_value(c,&state,1);}
+        else if(kind_==Kind::IMU){uint8_t b[12];for(int i=0;i<6;++i){const uint16_t v=imu_telemetry[i];b[2*i]=v;b[2*i+1]=v>>8;}set_value(c,b,sizeof(b));}
+        else if(kind_==Kind::SERVO){uint8_t b[ACTION_DIM*2];for(int i=0;i<ACTION_DIM;++i){const uint16_t v=std::lround(SERVO_CENTERS_US[i]);b[2*i]=v;b[2*i+1]=v>>8;}set_value(c,b,sizeof(b));}
+        else if(kind_==Kind::OTA_STATUS){uint8_t b[32]={OTA_PROTOCOL_VERSION,uint8_t(ota_state),uint8_t(ota_error),ota_target_partition};
+            write_u32(&b[4],ota_bytes_received);write_u32(&b[8],ota_total_bytes);write_u32(&b[12],ota_chunks_received);
+            const esp_partition_t *running=esp_ota_get_running_partition();b[16]=running&&running->subtype>=ESP_PARTITION_SUBTYPE_APP_OTA_MIN?
+                uint8_t(running->subtype-ESP_PARTITION_SUBTYPE_APP_OTA_MIN):0xff;b[19]=1;write_u32(&b[28],ESP32_S3_FAMILY_ID);set_value(c,b,sizeof(b));}}
+    void onWrite(BLECharacteristic *c)override{const std::string value=c->getValue();
+        const auto *data=reinterpret_cast<const uint8_t*>(value.data());const size_t size=value.size();
+        if(kind_==Kind::CONTROL){if(ota_locks_robot()||size!=1||data[0]>uint8_t(ControlCommand::STOP))return;
+            if(data[0]==uint8_t(ControlCommand::STOP))stop_requested=true;else xQueueSend(control_command_queue,data,0);}
+        else if(kind_==Kind::SERVO){if(ota_locks_robot()||size!=3)return;const int16_t delta=int16_t(uint16_t(data[1])|(uint16_t(data[2])<<8));
+            const bool finish=data[0]==SERVO_CALIBRATION_FINISH;if((finish&&delta)||( !finish&&(data[0]>=ACTION_DIM||!delta||delta< -SERVO_CALIBRATION_MAX_STEP_US||delta>SERVO_CALIBRATION_MAX_STEP_US)))return;
+            const ServoCalibrationCommand command={data[0],delta};xQueueSend(servo_calibration_command_queue,&command,0);}
+        else if(kind_==Kind::OTA_CONTROL){if(!size||size>OTA_MAX_CONTROL_PACKET_SIZE)return;const bool valid=
+            (data[0]==OTA_CONTROL_BEGIN&&size==OTA_BEGIN_PACKET_SIZE)||(data[0]==OTA_CONTROL_DIGEST&&size>2)||
+            ((data[0]==OTA_CONTROL_ABORT||data[0]==OTA_CONTROL_COMMIT)&&size==1);if(!valid)return;
+            OtaControlPacket packet={};packet.length=size;std::memcpy(packet.bytes,data,size);xQueueSend(ota_control_queue,&packet,0);}
+        else if(kind_==Kind::OTA_DATA){if(size<=4||size>OTA_MAX_DATA_VALUE_SIZE||ota_state!=OtaState::RECEIVING)return;
+            OtaDataPacket packet={};packet.length=size;std::memcpy(packet.bytes,data,size);xQueueSend(ota_data_queue,&packet,0);}}
+private:Kind kind_;};
+class RickServerCallbacks:public BLEServerCallbacks{void onConnect(BLEServer*)override{printf("Bluetooth connected.\n");}
+    void onDisconnect(BLEServer*)override{stop_requested=true;ota_abort_requested=true;printf("Bluetooth disconnected; stopping policy.\n");BLEDevice::startAdvertising();}};
+BLECharacteristic *create_characteristic(BLEService *service,const char *uuid,uint32_t properties,
+    esp_gatt_perm_t permissions,RickCharacteristicCallbacks::Kind kind){auto *c=service->createCharacteristic(uuid,properties);
+    c->setAccessPermissions(permissions);c->setCallbacks(new RickCharacteristicCallbacks(kind));return c;}
+bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *server=BLEDevice::createServer();
+    server->setCallbacks(new RickServerCallbacks());auto *service=server->createService(SERVICE_UUID);
+    create_characteristic(service,CONTROL_UUID,BLECharacteristic::PROPERTY_READ|BLECharacteristic::PROPERTY_WRITE,
+        esp_gatt_perm_t(ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE_ENCRYPTED),RickCharacteristicCallbacks::Kind::CONTROL);
+    create_characteristic(service,IMU_UUID,BLECharacteristic::PROPERTY_READ,ESP_GATT_PERM_READ,RickCharacteristicCallbacks::Kind::IMU);
+    create_characteristic(service,SERVO_UUID,BLECharacteristic::PROPERTY_READ|BLECharacteristic::PROPERTY_WRITE,
+        esp_gatt_perm_t(ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE_ENCRYPTED),RickCharacteristicCallbacks::Kind::SERVO);
+    create_characteristic(service,OTA_CONTROL_UUID,BLECharacteristic::PROPERTY_WRITE,ESP_GATT_PERM_WRITE_ENCRYPTED,RickCharacteristicCallbacks::Kind::OTA_CONTROL);
+    create_characteristic(service,OTA_DATA_UUID,BLECharacteristic::PROPERTY_WRITE,ESP_GATT_PERM_WRITE_ENCRYPTED,RickCharacteristicCallbacks::Kind::OTA_DATA);
+    create_characteristic(service,OTA_STATUS_UUID,BLECharacteristic::PROPERTY_READ,ESP_GATT_PERM_READ,RickCharacteristicCallbacks::Kind::OTA_STATUS);
+    service->start();auto *security=new BLESecurity();security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
+    security->setCapability(ESP_IO_CAP_NONE);security->setKeySize(16);
+    security->setInitEncryptionKey(esp_ble_key_type_t(ESP_BLE_ENC_KEY_MASK|ESP_BLE_ID_KEY_MASK));
+    auto *advertising=BLEDevice::getAdvertising();advertising->addServiceUUID(SERVICE_UUID);advertising->setScanResponse(true);
+    advertising->setMinPreferred(0x0c);advertising->setMaxPreferred(0x0c);BLEDevice::startAdvertising();
+    printf("Bluetooth ready as RickBot. Waiting for Android.\n");return true;}
+
+void setup(){neopixelWrite(PIN_STATUS_LED, 16, 16, 16);Serial.begin(115200);delay(250);printf("\nStarting Rick ESP32-S3 policy checkpoint %u (%d obs, %d actions)...\n",
+    unsigned(POLICY_CHECKPOINT_STEP),OBS_DIM,ACTION_DIM);printf("Controller: ESP32-S3 LX7 at %u MHz, target period=%lu us.\n",
+    getCpuFrequencyMhz(),static_cast<unsigned long>(CONTROL_PERIOD_US));
+    control_command_queue=xQueueCreate(8,sizeof(uint8_t));servo_calibration_command_queue=xQueueCreate(8,sizeof(ServoCalibrationCommand));
+    ota_control_queue=xQueueCreate(4,sizeof(OtaControlPacket));ota_data_queue=xQueueCreate(8,sizeof(OtaDataPacket));
+    if(!control_command_queue||!servo_calibration_command_queue||!ota_control_queue||!ota_data_queue){printf("Could not allocate command queues.\n");abort();}
+    if(!init_imu()){printf("Tokmas ICM-42688-P initialization failed; servos remain disabled.\n");
+        while(true)delay(1000);}
+    init_servos();reset_servos(0);control_state=CONTROL_STATE_DEFAULT;
+    printf("Servos at calibrated default pose; policy is stopped.\n");init_bluetooth();control_schedule.reset(time_us_64());}
+void loop(){process_ota_abort_request();process_ota_control_packets();process_ota_data_packets();
+    if(!ota_locks_robot()){process_control_commands();process_servo_calibration_commands();}
+    const uint64_t now=time_us_64();if(ota_locks_robot()){control_schedule.reset(now);imu_clock.reset();}
+    else{uint64_t skipped=0;if(control_schedule.take(now,skipped)){float gx,gy,gz,ax,ay,az;
+        if(!read_imu(&gx,&gy,&gz,&ax,&ay,&az)){++imu_consecutive_read_errors;if((++imu_read_errors&0x3f)==1)printf("Tokmas IMU I2C read failed (%lu errors).\n",static_cast<unsigned long>(imu_read_errors));if(imu_consecutive_read_errors>=3)stop_requested=true;imu_clock.reset();delay(0);return;}imu_consecutive_read_errors=0;
+        const uint64_t sample=time_us_64();const float imu_dt=imu_clock.step(sample,POLICY_CONTROL_DT);
+        if constexpr(POLICY_GYRO_BIAS_CALIBRATION){const float gyro[3]={gx,gy,gz},accel[3]={ax,ay,az};
+            if(skipped||imu_dt>1.5f*POLICY_CONTROL_DT)gyro_calibration.reset_window();
+            if(gyro_calibration.observe(gyro,accel,!robot_running&&!servo_calibration_active))printf("Gyro bias calibrated: %.5f %.5f %.5f rad/s.\n",
+                gyro_calibration.bias(0),gyro_calibration.bias(1),gyro_calibration.bias(2));
+            gx-=gyro_calibration.bias(0);gy-=gyro_calibration.bias(1);gz-=gyro_calibration.bias(2);}
+        madgwick_update_6dof(gx,gy,gz,ax,ay,az,imu_dt);if(robot_running){gait_phase=gait_clock.sample(sample,POLICY_STEP_FREQUENCY);
+            update_imu_and_clock_observation(gx,gy,gz);const uint64_t started=time_us_64();policy_network.infer(current_obs,target_actions);
+            const uint64_t inference=time_us_64()-started;update_servos(target_actions);append_command_history(target_actions);++step_counter;
+            const uint64_t finished=time_us_64();control_timing.record(now,finished,inference,skipped,control_schedule.next_us());report_control_timing(finished);}}}
+    delay(0);}

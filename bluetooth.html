@@ -552,7 +552,7 @@
   <main>
     <header>
       <div>
-        <p class="eyebrow">Pico 2 W · BLE</p>
+        <p class="eyebrow">ESP32-S3 · BLE</p>
         <h1>Rick<br>control</h1>
       </div>
       <div class="header-actions">
@@ -673,13 +673,13 @@
       <div class="tool-heading">
         <div>
           <h2 id="firmwareHeading">Firmware update</h2>
-          <p>Install a new Rick Pico UF2 over the encrypted Bluetooth connection.</p>
+          <p>Install a new Rick ESP32-S3 binary over the encrypted Bluetooth connection.</p>
         </div>
         <span class="tool-status" id="firmwareStatus">WAITING</span>
       </div>
 
-      <input class="firmware-picker" id="firmwareFile" type="file" accept=".uf2,application/octet-stream" disabled>
-      <p class="firmware-file" id="firmwareFileDetail">Connect to an OTA-enabled RickBot, then choose rick_v2_pico.uf2.</p>
+      <input class="firmware-picker" id="firmwareFile" type="file" accept=".bin,.uf2,application/octet-stream" disabled>
+      <p class="firmware-file" id="firmwareFileDetail">Connect to RickBot, then choose the PlatformIO firmware.bin.</p>
       <progress class="firmware-progress" id="firmwareProgress" value="0" max="1" aria-label="Firmware upload progress"></progress>
       <p class="tool-note" id="firmwareProgressText" role="status" aria-live="polite">No update in progress.</p>
 
@@ -706,6 +706,7 @@
 
     const OTA_PROTOCOL_VERSION_LEGACY = 1;
     const OTA_PROTOCOL_VERSION_COMPACT = 2;
+    const OTA_PROTOCOL_VERSION_ESP32 = 3;
     const OTA_CONTROL_BEGIN = 1;
     const OTA_CONTROL_ABORT = 2;
     const OTA_CONTROL_COMMIT = 3;
@@ -727,6 +728,7 @@
     const UF2_ABSOLUTE_FAMILY = 0xe48bff57;
     const UF2_RP2350_ARM_S_FAMILY = 0xe48bff59;
     const UF2_RP2350_RISCV_FAMILY = 0xe48bff5a;
+    const ESP32_S3_FAMILY_ID = 0x53335045;
 
     const otaErrorLabels = [
       "No error",
@@ -739,15 +741,15 @@
       "Flash programming failed",
       "The completed upload did not match its SHA-256 hash",
       "Bluetooth disconnected during the upload",
-      "The RP2350 boot ROM rejected the programmed image",
-      "The RP2350 boot ROM could not start the update reboot"
+      "The bootloader rejected the programmed image",
+      "The bootloader could not start the update reboot"
     ];
 
     const servoNames = [
       "Left roll", "Left upper", "Left lower", "Left foot",
       "Right roll", "Right upper", "Right lower", "Right foot"
     ];
-    const servoPins = [12, 4, 3, 2, 13, 7, 5, 6];
+    const servoPins = [6, 7, 8, 9, 10, 11, 12, 13];
     const axisLabels = ["+X right", "+Y down", "+Z forward"];
 
     const stateLabels = [
@@ -878,6 +880,14 @@
     }
 
     function firmwareTransferForProtocol(firmware, protocolVersion) {
+      if (protocolVersion === OTA_PROTOCOL_VERSION_ESP32) {
+        return {
+          stream: firmware.binaryStream,
+          digest: firmware.binaryDigest,
+          chunkSizes: OTA_COMPACT_DATA_CHUNK_SIZES,
+          label: "ESP32 binary"
+        };
+      }
       if (protocolVersion === OTA_PROTOCOL_VERSION_COMPACT) {
         return {
           stream: firmware.compactStream,
@@ -1051,7 +1061,8 @@
       if (value.byteLength < 16) throw new Error("Firmware update status was incomplete");
       const protocolVersion = value.getUint8(0);
       if (protocolVersion !== OTA_PROTOCOL_VERSION_LEGACY &&
-          protocolVersion !== OTA_PROTOCOL_VERSION_COMPACT) {
+          protocolVersion !== OTA_PROTOCOL_VERSION_COMPACT &&
+          protocolVersion !== OTA_PROTOCOL_VERSION_ESP32) {
         throw new Error("RickBot uses an incompatible update protocol");
       }
       const extendedStatus = value.byteLength >= 28;
@@ -1169,27 +1180,48 @@
       };
     }
 
+    async function parseEsp32Firmware(file) {
+      if (!globalThis.crypto?.subtle) {
+        throw new Error("SHA-256 requires opening Rick Control from its HTTPS address");
+      }
+      const binaryStream = new Uint8Array(await file.arrayBuffer());
+      if (binaryStream.byteLength < 1024 || binaryStream[0] !== 0xe9) {
+        throw new Error("Choose the PlatformIO ESP32-S3 firmware.bin image");
+      }
+      const digest = await crypto.subtle.digest("SHA-256", binaryStream);
+      return {
+        name: file.name,
+        binaryStream,
+        binaryDigest: new Uint8Array(digest),
+        family: ESP32_S3_FAMILY_ID,
+        codeSize: binaryStream.byteLength,
+        blockCount: Math.ceil(binaryStream.byteLength / 256)
+      };
+    }
+
     async function chooseFirmware() {
       const file = firmwareFileInput.files?.[0];
       selectedFirmware = null;
-      showFirmwareProgress(0, 1, "Inspecting and hashing the selected UF2…");
+      showFirmwareProgress(0, 1, "Inspecting and hashing the selected firmware…");
       showFirmwareStatus("CHECKING", file?.name || "No file selected");
       updateButtons();
 
       if (!file) {
-        showFirmwareStatus("WAITING", "Choose rick_v2_pico.uf2 to prepare an update.");
+        showFirmwareStatus("WAITING", "Choose the PlatformIO firmware.bin to prepare an update.");
         showFirmwareProgress(0, 1, "No update in progress.");
         updateButtons();
         return;
       }
 
       try {
-        selectedFirmware = await parseUf2Firmware(file);
+        selectedFirmware = otaProtocolVersion === OTA_PROTOCOL_VERSION_ESP32
+          ? await parseEsp32Firmware(file)
+          : await parseUf2Firmware(file);
         showSelectedFirmwareReady();
       } catch (error) {
         firmwareFileInput.value = "";
         showFirmwareStatus("INVALID", error.message || error.name);
-        showFirmwareProgress(0, 1, "Choose a different UF2 file.");
+        showFirmwareProgress(0, 1, "Choose a different firmware file.");
       }
       updateButtons();
     }
@@ -1205,7 +1237,7 @@
         return length;
       } catch (writeError) {
         // A lost ATT response does not necessarily mean the write was lost.
-        // Ask the Pico before retrying so an accepted chunk is never sent twice.
+        // Ask the controller before retrying so an accepted chunk is never sent twice.
         await new Promise((resolve) => setTimeout(resolve, 80));
         try {
           const status = await readOtaStatus();
@@ -1220,7 +1252,7 @@
 
     function checkFirmwareFamily(firmware, status) {
       if (firmware.family !== status.firmwareFamily) {
-        throw new Error("Switching between ARM and RISC-V requires a USB firmware install. Bluetooth updates work after that first install.");
+        throw new Error("This firmware targets different hardware. Install the correct image over USB first.");
       }
     }
 
@@ -1489,7 +1521,7 @@
                   `Expected slot ${expectedBootPartition}, but RickBot booted slot ${otaStatus.bootPartition}.`
                 );
                 setMessage(
-                  "The RP2350 returned to the previous firmware. Check the boot diagnostic over USB serial.",
+                  "The bootloader returned to a different firmware slot. Check USB serial diagnostics.",
                   true
                 );
                 expectedBootPartition = null;
@@ -1500,19 +1532,19 @@
                 "RickBot returned on firmware that cannot report its boot slot."
               );
               setMessage(
-                "The update rolled back on the older boot setup. Install ota_partition.uf2 once over USB, reboot, then install rick_v2_pico.uf2.",
+                "This firmware cannot report its active slot. Install the ESP32-S3 build once over USB.",
                 true
               );
               expectedBootPartition = null;
             } else if (otaStatus.state === OTA_STATE_READY) {
               showFirmwareStatus(
                 "READY TO BOOT",
-                "A verified update is waiting in the inactive slot. Select and upload the UF2 again if you did not initiate it."
+                "A verified update is waiting in the inactive slot. Select and upload the binary again if you did not initiate it."
               );
             } else {
               showFirmwareStatus(
                 "CONNECTED",
-                "Choose rick_v2_pico.uf2 to prepare a wireless update."
+                "Choose the PlatformIO firmware.bin to prepare a wireless update."
               );
             }
             if (expectedBootPartition === null &&
@@ -1522,7 +1554,7 @@
           } else {
             showFirmwareStatus(
               "WIRED SETUP",
-              "This firmware predates wireless updates. Flash the new UF2 over USB once."
+              "This firmware predates wireless updates. Flash the ESP32-S3 build over USB once."
             );
             setMessage("Bluetooth connected. A one-time wired flash is required to enable wireless updates.");
           }
@@ -1547,7 +1579,7 @@
           setMessage("No device selected. Tap Pair & connect to try again.");
         } else {
           showConnection("Connection failed", "Could not reach RickBot", "");
-          setMessage(`${error.message || error.name}. Power-cycle the Pico and try again.`, true);
+          setMessage(`${error.message || error.name}. Power-cycle RickBot and try again.`, true);
         }
       } finally {
         busy = false;
@@ -1591,7 +1623,7 @@
       } else if (interruptedFirmwareUpdate) {
         expectedBootPartition = null;
         showConnection("Disconnected", "Update interrupted · current firmware remains safe", "");
-        showFirmwareStatus("INTERRUPTED", "Reconnect and select the UF2 to retry.");
+        showFirmwareStatus("INTERRUPTED", "Reconnect and select firmware.bin to retry.");
         showFirmwareProgress(0, 1, "The inactive slot was not activated.");
         setMessage("Bluetooth disconnected during the update. The current firmware is unchanged.", true);
       } else {

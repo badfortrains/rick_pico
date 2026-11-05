@@ -1,323 +1,164 @@
-# RickJoystickFlatTerrain on Raspberry Pi Pico 2 W
+# RickJoystickFlatTerrain on Waveshare ESP32-S3-Zero
 
-This firmware runs the deterministic policy from the Brax PPO checkpoint. The
-generated `policy_weights.h` contains both the network parameters and the
-deployment constants saved with the training run.
+This firmware runs Rick's deterministic Brax PPO policy on a Waveshare
+ESP32-S3-Zero. It drives eight hobby servos at 50 Hz, reads a Tokmas
+ICM-42688-P over I2C, exposes encrypted Bluetooth controls, and supports
+dual-slot BLE firmware updates.
 
-## Export a checkpoint
+The target is the standard ESP32-S3-Zero with 4 MB flash and 2 MB QSPI PSRAM.
+PlatformIO uses Waveshare's recommended `esp32-s3-devkitm-1` board profile with
+the flash, PSRAM, USB CDC, and partition layout overridden in `platformio.ini`.
 
-Run the exporter from a Python environment containing `numpy`, `jax`, and
-`orbax-checkpoint` (the `mujoco_playground` environment already includes them):
+## Wiring
+
+| Device | Connector/signal | GPIO |
+|---|---|---:|
+| Left roll servo | J4 / PWM | 6 |
+| Left upper servo | J5 / PWM | 7 |
+| Left lower servo | J6 / PWM | 8 |
+| Left foot servo | J7 / PWM | 9 |
+| Right roll servo | J8 / PWM | 10 |
+| Right upper servo | J9 / PWM | 11 |
+| Right lower servo | J10 / PWM | 12 |
+| Right foot servo | J11 / PWM | 13 |
+| Tokmas ICM-42688-P | SDA | 2 |
+| Tokmas ICM-42688-P | SCL | 4 |
+| Tokmas ICM-42688-P | INT1 | 5 |
+
+The IMU is JLCPCB/LCSC part `C54308212`, uses the 7-bit I2C address `0x36`,
+and runs from 3.3 V. It is not register-compatible with the TDK part carrying
+the same ICM-42688-P name. Firmware follows the Tokmas quick-start sequence and
+checks its `0xA1` chip ID before enabling any servo outputs. INT1 is configured
+as an input but the 50 Hz controller currently polls the 110 Hz sensor stream.
+The sensor-to-robot axis transform is unchanged; verify it with the controller's
+IMU axis check because the assembled package orientation cannot be inferred
+from the connector pinout alone.
+
+GPIO21 is not used because it drives the ESP32-S3-Zero's onboard WS2812. The
+USB D-/D+ pins, GPIO19 and GPIO20, are also left free. The eight servos need an
+external supply with a common ground; do not power them from the board's 3.3 V
+rail or USB regulator.
+
+Verify `SERVO_PINS`, `SERVO_DIRS`, and `SERVO_CENTERS_US` in `main.cpp` before
+applying servo power. Test with the robot supported off the ground.
+
+## Build and first flash
+
+Install PlatformIO, then run:
 
 ```sh
-python export_policy.py \
-  /Users/suzanna/Documents/code/checkpoints/RickJoystickFlatTerrain-20260818-165853/checkpoints/000068812800
+pio run
 ```
 
-By default this replaces `policy_weights.h` beside the script. The exporter
-checks the PPO configuration, all layer shapes, the Rick observation
-layout, and float32 serialization before writing the header.
+The flashable application image is:
 
-The exporter also writes `POLICY_DEFAULT_POSE_RAD` from the model XML's
-`basic` keyframe `ctrl`, matching the training environment's servo targets.
-It locates the saved XML using `diagnostics/final/metadata.json` beside the
-run's `checkpoints` directory (or beside the step directory). To use another
-model, pass `--model-xml /path/to/model.xml`. If no saved XML or `basic.ctrl`
-is available, it exports a zero pose and reports that fallback. Invalid target
-counts and nonfinite values fail the export. Startup, reset, and policy servo
-commands use this generated pose; mechanical-zero calibration bypasses it.
+```text
+.pio/build/waveshare_esp32_s3_zero/firmware.bin
+```
 
-The deployed observation is:
+For the first install, hold the ESP32-S3-Zero **BOOT** button while connecting
+USB, release it after the board appears, and run:
 
-- indices 0--95: twelve previous 8-servo commands, oldest first
-- indices 96--98: body-frame projected gravity
-- indices 99--101: body-frame gyro in rad/s, scaled by 0.25 (bias corrected for new policies)
-- indices 102--103: sine/cosine of the exported gait clock (currently 1.2 Hz)
-- index 104: target forward velocity (0.068 m/s)
-- indices 105--106, for heading-aware policies: sine/cosine of estimated
-  heading minus the heading captured at **Start**
+```sh
+pio run --target upload
+pio device monitor
+```
 
-New training defaults use 107 observations. The exporter writes explicit
-heading/calibration flags and firmware supports both layouts. Older headers
-and checkpoints retain their original 105-value observations and raw gyro.
-Heading comes from the same Madgwick quaternion in simulation and firmware;
-it uses the horizontal projection of the IMU's `-Y` forward axis, with positive
-yaw toward `+X`. No simulation ground-truth heading enters the policy.
+The first wired upload installs the bootloader, two-slot partition table, and
+application. Later wired uploads can normally use the same command without
+holding BOOT; if native USB is unavailable, enter download mode again.
 
-For new policies, keep Rick stopped and still for at least two seconds after
-boot (100 samples at 50 Hz) before pressing **Start**. Firmware averages gyro
-bias during stationary windows, rejects movement and acceleration, and freezes
-the correction while walking. Start is ignored until the first calibration
-finishes; USB serial reports completion. Hold the robot still: slow constant
-rotation can resemble sensor bias. Each Start captures a fresh heading reference
-without resetting the settled gravity filter. Heading remains a relative,
-gyro-derived estimate and can accumulate drift over long runs.
+The custom 4 MB partition table provides two 1.94 MB application slots. The
+current build is about 1.20 MB. PlatformIO fails the build if the image grows
+beyond one slot.
 
-The current network is `105 -> 128 -> 128 -> 128 -> 128 -> 16` with SiLU hidden
-activations. Deterministic actions are `tanh` of the first eight outputs. The
-current checkpoint contains 65,168 float32 policy parameters (about 255 KiB in
-flash, before code).
+## Policy and control loop
 
-These dimensions and constants come from `policy_weights.h`; the controller
-also supports older exported history lengths. Inference streams each row of
-the exported Flax weight matrices contiguously from flash, preserving each
-output's accumulation order. No checkpoint re-export is needed for this
-optimization.
+`policy_weights.h` contains the network parameters and deployment constants
+exported with the training run. The controller maintains command history,
+projected gravity, body-frame gyro, gait clock, target velocity, and optional
+relative-heading observations. Policy inference and servo updates run at the
+exported 50 Hz control rate.
 
-Training now also penalizes lateral velocity and yaw rate averaged over a
-sliding full gait period, before squaring. Fractional weighting of the oldest
-sample covers exactly one period; penalties begin after the window fills.
-Instantaneous penalties remain light. New diagnostic metrics are
-`cycle_sideways_velocity`, `cycle_yaw_rate`, `cycle_window_ready`,
-`cost_cycle_sideways_velocity`, `cost_cycle_yaw_rate`, and
-`estimated_heading_error`. Default cycle penalty weights are 0.5 for lateral
-velocity (normalized by `tracking_sigma`) and 4.0 for yaw rate. These are initial
-settings to evaluate, not an established improvement on the real robot.
+The firmware continuously settles its Madgwick attitude estimate while
+stopped. Heading-aware policies capture a fresh relative heading when Start is
+pressed. If gyro-bias calibration is enabled in the exported header, keep Rick
+still for the reported calibration interval after boot.
 
-When fine-tuning a pre-heading Rick checkpoint, `learning/train_jax_ppo.py`
-automatically appends two zero-weight inputs to both policy and critic and
-extends the normalizer with unit-variance heading channels. Existing outputs
-are preserved for identical old observation inputs. The source checkpoint is
-unchanged; training learns how to use heading. `rick_spot/automate_training.py`
-includes this upgrade module in its VM source bundle. Start from the successful
-`20261015-234303` checkpoint and use the normal `--load-checkpoint-path` workflow.
-The existing `policy_weights.h` remains the currently exported policy until a
-newly trained checkpoint is exported.
+To export a different checkpoint, use the Python environment containing
+`numpy`, `jax`, and `orbax-checkpoint`:
 
-## Servo wiring and calibration
+```sh
+python export_policy.py /path/to/checkpoint/step
+pio run
+```
 
-The policy/XML actuator order and default GPIO mapping are:
-
-| Action | Joint | GPIO |
-|---:|---|---:|
-| 0 | left roll | 12 |
-| 1 | left upper | 4 |
-| 2 | left lower | 3 |
-| 3 | left foot | 2 |
-| 4 | right roll | 13 |
-| 5 | right upper | 7 |
-| 6 | right lower | 5 |
-| 7 | right foot | 6 |
-
-GPIO 12 and 13 are new defaults for the two actuators absent from the previous
-six-servo firmware. Update `SERVO_PINS`, `SERVO_DIRS`, and
-`SERVO_CENTERS_US` in `main.cpp` to match the physical robot. The six existing
-pin assignments and the calibrated 1460/1440 us foot centers were retained at
-their corresponding shifted indices.
-
-Test with the robot supported off the ground first. The policy was trained
-with `action_scale = 0.40` radians, so the firmware converts a policy action of
-`+/-1` to about `+/-255 us` around the default pose. The default servo targets
-come from `POLICY_DEFAULT_POSE_RAD` in the exported header, added to each
-calibrated mechanical-zero center with `SERVO_DIRS` applied. Servos need an
-external power supply with a common ground; do not power eight servos from the
-Pico.
+The exporter validates layer shapes, observation layout, and float32
+serialization before replacing `policy_weights.h`. The generated
+`POLICY_DEFAULT_POSE_RAD` comes from the model's `basic` keyframe when that
+metadata is available.
 
 ## Bluetooth control
 
-The Pico advertises a Bluetooth Low Energy device named **RickBot**. On boot,
-the firmware moves to the calibrated default pose and remains stopped until it
-receives a Start command. Robot-changing commands use encrypted LE Secure
-Connections with Just Works confirmation and store the Android bond in flash.
-State and telemetry reads do not require pairing, so Android can finish GATT
-discovery before it prompts for security on the first command.
+The board advertises as **RickBot** using the same service and characteristic
+UUIDs as the Pico firmware. Open `bluetooth.html` from an HTTPS host in Chrome
+on Android and choose **Pair & connect**. Robot-changing characteristics require
+an encrypted bonded connection; telemetry and state reads remain available
+during GATT discovery.
 
-Copy `bluetooth.html` to the Android device and open it in Chrome, then:
+The controller provides:
 
-1. Tap **Pair & connect** and choose **RickBot**.
-2. Tap a control and approve the Android pairing request if one appears.
-3. Use one of the four controls:
-   - **Reset to default pos** stops the policy and moves all servos to their
-     calibrated `basic` keyframe targets.
-   - **Reset to full action** stops the policy and sends normalized policy
-     action `+1.0` to every servo (the full trained action range around each
-     default target, with `SERVO_DIRS` applied).
-   - **Start** resets the gait clock while preserving the IMU orientation
-     estimate prewarmed continuously while stopped, then runs the PPO policy
-     at 50 Hz.
-   - **Stop** stops policy inference and holds the last commanded servo pose.
+- reset to the exported default pose;
+- reset all normalized policy actions to `+1.0`;
+- start and stop policy inference;
+- live physical-frame accelerometer and gyro checks;
+- live servo-center calibration;
+- encrypted wireless firmware updates.
 
-The same page includes two calibration tools:
-
-- **IMU axis check** shows live accelerometer and gyroscope readings in the
-  physical sensor frame. To verify a direction, point the named positive axis
-  straight up, hold the robot still, and tap its check button. A passing axis
-  reads about `+1 g` with the other two axes near zero. Complete all three to
-  confirm `+X` right, `+Y` down, and `+Z` forward.
-- **Servo centers** adjusts any of the eight neutral pulse widths in 1, 5, or
-  10 us steps. The first adjustment stops the policy and commands every joint
-  to its center. Mark each joint after mechanically centering it, then tap
-  **Finish & print values**. The page displays a complete
-  `SERVO_CENTERS_US` declaration and the firmware prints the same declaration
-  over USB serial.
-
-Servo calibration changes live RAM only. Copy the generated declaration into
-`main.cpp` and rebuild/flash the firmware to preserve it across a reboot.
-Finishing calibration returns to the `basic` default pose.
-
-Disconnecting Bluetooth also stops the policy and holds the last pose. Always
-test and calibrate with the robot supported off the ground first.
-
-Web Bluetooth is supported by Chrome on Android and is restricted to secure
-contexts. The controller can still be opened directly for development, but its
-install and offline features require `bluetooth.html`, `manifest.webmanifest`,
-`service-worker.js`, and the `icons` directory to be served together from an
-HTTPS static host.
-
-The controller is also an installable Progressive Web App when served over
-HTTPS. Open it in Chrome on Android, then use the in-page **Install app** button
-when it appears, or choose **Add to Home screen** from Chrome's menu. The app
-shell is cached so the controller can open without an internet connection;
-Bluetooth still needs to be enabled on the phone.
+Disconnecting Bluetooth stops the policy and holds the last servo command.
+Servo-center changes are kept only in RAM; copy the generated
+`SERVO_CENTERS_US` declaration into `main.cpp` and rebuild to preserve them.
 
 ## Wireless firmware updates
 
-The Pico 2 W firmware and Rick Control page support encrypted BLE firmware
-updates. The resident RP2350 partition table occupies the first 8 KiB of
-flash, followed by two 2036 KiB application slots. An update is always written
-to the inactive slot, so disconnecting Bluetooth or losing power during an
-upload leaves the currently running firmware intact. The final 16 KiB of flash
-are kept outside both slots for BTstack's bond store and the RP2350-E10
-reserved sector.
+After one wired install, select
+`.pio/build/waveshare_esp32_s3_zero/firmware.bin` in Rick Control. Protocol 3
+streams the raw ESP32 image to the inactive OTA slot, checks the full SHA-256
+digest, asks ESP-IDF to validate the image, and only then marks that slot for
+boot and restarts.
 
-The build is hashed and marked **Try Before You Buy**. After an update, the
-RP2350 boot ROM starts the new slot under its rollback watchdog. The firmware
-accepts the new slot only after the robot hardware and Bluetooth stack have
-initialized; otherwise the boot ROM returns to the previous slot.
+An interrupted or rejected transfer does not change the active boot partition.
+The stock Arduino framework used here does not enable ESP-IDF's runtime
+rollback watchdog, so an image that passes structural validation but fails only
+after boot must be recovered over USB. Keep a known-good wired build available.
 
-### One-time wired setup
+Do not select the old `rick_v2_pico.uf2`: RP2350 UF2 files are intentionally
+rejected by the ESP32 protocol. The web controller retains its older UF2 parser
+only so it can still service robots running the prior Pico firmware.
 
-The partition table and application are deliberately separate. This matches
-the RP2350 A/B update flow and keeps the later wireless-update UF2 free of
-partition-table metadata.
+## Verification
 
-For a Pico 2 W with empty/unpartitioned flash:
-
-1. Build the project, enter BOOTSEL mode, and copy
-   `build/ota_partition.uf2` to the Pico.
-2. Let it reboot, then create a one-time bootstrap build with
-   `-DRICK_BOOTSTRAP_IMAGE=ON`. Enter BOOTSEL a second time and load that
-   build's `rick_v2_pico.uf2` with Picotool's `-x` option. The bootstrap image
-   is not TBYB because neither slot contains a bought fallback yet.
-3. Build normally afterward. The regular `build/rick_v2_pico.uf2` remains
-   hashed and TBYB-enabled for all later Bluetooth updates.
-
-Installing `ota_partition.uf2` is a one-time operation. Do not send that file
-through Rick Control. The earlier experimental OTA-enabled build embedded the
-table in replaceable slot A; that is not equivalent to installing the resident
-table, so a Pico flashed with that build must also complete both wired steps
-above once. Keep the robot supported and keep servo power safely isolated
-during the first application boot.
-
-### Later updates over Bluetooth
-
-1. Rebuild the project to create a new `build/rick_v2_pico.uf2`.
-2. Open the HTTPS-hosted Rick Control page in Chrome on Android and connect to
-   RickBot.
-3. In **Firmware update**, choose `rick_v2_pico.uf2` and tap **Install
-   firmware**.
-4. Keep the Pico powered while the page uploads and verifies the image. RickBot
-   disconnects when it reboots into the verified slot. Reconnect after a few
-   seconds; the page then reports whether the new slot was confirmed or the
-   boot ROM rolled back to the previous slot.
-
-The page accepts complete RP2350 ARM Secure or RISC-V Rick firmware UF2s and
-validates every block before uploading, rejecting mixed architectures. The
-firmware accepts only its own CPU architecture; switching architectures
-requires a USB install first (see below). The extended OTA status includes
-the running firmware's family ID, so the page detects this before uploading.
-Older firmware without this field is recognized as RISC-V.
-Protocol-v2 firmware receives only each block's
-256-byte flash payload instead of its full 512-byte UF2 wrapper, cutting the
-radio transfer roughly in half. The page tries 508-byte data chunks when the
-negotiated ATT MTU permits them and automatically falls back as far as 16-byte
-chunks. Firmware also requests a 15 ms BLE connection interval, though the
-Android device makes the final connection-parameter decision.
-
-The page remains compatible with protocol-v1 firmware and uses the original
-full-UF2, 240-byte-chunk transfer for the one update that installs protocol v2.
-Later updates automatically use the compact path. The firmware independently
-validates the requested family, compact image length, stream order, target
-partition range, full SHA-256 transfer digest, and programmed slot with the
-RP2350 boot ROM before enabling the reboot. The update GATT characteristics
-require the same encrypted BLE connection as robot-changing commands. USB
-BOOTSEL remains the recovery path if both firmware slots are ever damaged.
-
-## Build
-
-The project defaults to `pico2_w`, `rp2350-arm-s`, and the Cortex-M33 hardware
-single-precision FPU. It uses Pico SDK 2.3.0, ARM toolchain 15_2_Rel1, and
-Picotool 2.3.0. Ensure the SDK's `btstack` and `cyw43-driver` submodules are
-installed; the Pico extension normally manages these.
-
-When changing from a cached RISC-V build, configure afresh, using the CMake
-and Ninja installed by the Pico extension (or equivalent executables on PATH):
+Build the target and run the host regressions:
 
 ```sh
-cmake --fresh -S . -B build -G Ninja -DPICO_PLATFORM=rp2350-arm-s -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+pio run
+c++ -std=c++17 -O2 -I. tests/control_test.cpp -o /tmp/rick-control-test
+/tmp/rick-control-test
+python -m unittest tests/export_policy_test.py
+node tests/uf2_test.mjs .pio/build/waveshare_esp32_s3_zero/firmware.bin
 ```
 
-The output is `build/rick_v2_pico.uf2`. For a robot already using the resident
-A/B partition table, enter USB BOOTSEL and install the ARM application with
-Picotool so it performs the flash-update boot required by TBYB:
+On hardware, verify in this order with the robot supported:
 
-```sh
-picotool load -v -x build/rick_v2_pico.uf2
-```
+1. USB serial reports the ESP32-S3 startup and BLE advertising messages.
+2. The IMU axis check reports +X right, +Y down, and +Z forward.
+3. Each servo calibration control moves only its named joint.
+4. Stop and Bluetooth disconnect both hold the current pose.
+5. Policy inference remains near 50 Hz without timing overruns.
+6. A BLE update reboots into the other OTA slot and advertises again.
 
-The existing partition table already permits ARM and RISC-V; no replacement
-partition table is needed for this switch. The previously installed RISC-V
-firmware cannot accept the first ARM image over Bluetooth. Refresh/redeploy
-the updated Rick Control page as well; subsequent ARM updates use Bluetooth
-as usual. If no resident A/B table has been installed, use the one-time setup
-above first.
+## PWA hosting
 
-For an optional RISC-V comparison build, use a separate directory:
-
-```sh
-cmake -S . -B build_riscv -G Ninja -DPICO_PLATFORM=rp2350-riscv -DCMAKE_BUILD_TYPE=Release
-cmake --build build_riscv --parallel
-```
-
-## Control timing diagnostics
-
-While the policy is running, USB serial reports one timing summary per
-second. Open the serial monitor, then tap **Start**. The boot message also
-identifies the CPU architecture, system clock, and target control period.
-
-- `hz`: completed policy updates per second; expect approximately **50**.
-- `infer_us(avg/max)`: mean and worst network inference time in microseconds.
-- `step_us(max)`: worst complete sensing/filter/inference/servo step time.
-- `dt_us(min/max)`: actual intervals between policy step starts; expect about
-  **20000 us** with small scheduling variation.
-- `missed`: scheduled releases skipped because the controller was late by at
-  least one entire period.
-- `overruns`: steps that finished after the next scheduled release.
-
-Counters and maxima cover the reporting window. Aim for zero misses and
-overruns, with worst step time comfortably below 20000 us. USB output has
-zero wait timeout, so a stalled serial reader can drop output instead of
-blocking control for the SDK's usual half-second timeout.
-
-The controller services monotonic deadlines and counts skipped releases
-instead of collapsing timer interrupts into a Boolean. It never replays a
-backlog of actions against stale sensor data. Madgwick uses the actual IMU
-sample interval, and gait phase advances with elapsed time, starting at zero
-on the first policy sample after Start. An OTA pause resets the IMU timestamp
-while retaining its attitude estimate. These changes expose and limit the
-effects of overruns; sustained rates below 50 Hz still violate the policy's
-trained command-history timing and must be resolved before gait evaluation.
-
-Host regression checks (no Pico needed):
-
-```sh
-c++ -std=c++17 -O3 -ffp-contract=off -Wall -Wextra -Werror -I. tests/control_test.cpp -o /tmp/rick_control_test
-/tmp/rick_control_test
-node tests/uf2_test.mjs build/rick_v2_pico.uf2
-```
-
-These check policy output parity against the previous inference loop, late
-deadlines, elapsed-time phase/IMU updates, timestamp rollover, timing counters,
-and both UF2 architectures. On-device serial measurements are still required
-to establish the achieved control rate.
+Serve `bluetooth.html`, `manifest.webmanifest`, `service-worker.js`, and the
+`icons` directory together from an HTTPS static host. The cached app shell can
+open offline, but Bluetooth must still be enabled on the Android device.

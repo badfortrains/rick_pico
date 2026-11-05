@@ -10,15 +10,17 @@ const parser = html.slice(html.indexOf("    async function parseUf2Firmware("),
 const familyCheck = html.slice(html.indexOf("    function checkFirmwareFamily("),
                                html.indexOf("    async function installSelectedFirmware("));
 const protocolConstants = html.match(/    const OTA_PROTOCOL_VERSION_\w+ = [^;]+;/g).join("\n");
+const espFamilyConstant = html.match(/    const ESP32_S3_FAMILY_ID = [^;]+;/)[0];
 const statusReader = html.slice(html.indexOf("    async function readOtaStatus("),
                                 html.indexOf("    async function waitForOtaState("));
 const context = vm.createContext({
   crypto: webcrypto, Uint8Array, DataView, queueGattOperation: (operation) => operation()
 });
-vm.runInContext(constants + protocolConstants + parser + familyCheck + statusReader, context);
+vm.runInContext(constants + protocolConstants + espFamilyConstant + parser + familyCheck + statusReader, context);
 const arm = 0xe48bff59, riscv = 0xe48bff5a;
 for (const [length, protocol, family] of [[16, 1, riscv], [28, 2, riscv],
-                                        [32, 2, arm], [32, 2, riscv]]) {
+                                        [32, 2, arm], [32, 2, riscv],
+                                        [32, 3, 0x53335045]]) {
   const status = new DataView(new ArrayBuffer(length));
   status.setUint8(0, protocol);
   if (length >= 32) status.setUint32(28, family, true);
@@ -53,7 +55,7 @@ for (const family of [arm, riscv]) {
   assert.equal(result.compactDigest.length, 32);
   context.checkFirmwareFamily(result, { firmwareFamily: family });
   assert.throws(() => context.checkFirmwareFamily(result,
-    { firmwareFamily: family === arm ? riscv : arm }), /USB firmware install/);
+    { firmwareFamily: family === arm ? riscv : arm }), /correct image over USB/);
 }
 await assert.rejects(parse(uf2([arm, riscv])), /mixes CPU architectures/);
 await assert.rejects(parse(uf2([0xe48bff5b])), /Choose the ARM or RISC-V/);
@@ -63,9 +65,23 @@ await assert.rejects(parse(missing), /does not contain a complete/);
 const badFlags = uf2([arm]);
 new DataView(badFlags.buffer).setUint32(8, 0, true);
 await assert.rejects(parse(badFlags), /unsupported firmware block/);
+
+const espBinary = new Uint8Array(2048);
+espBinary[0] = 0xe9;
+const espResult = await context.parseEsp32Firmware({
+  name: "firmware.bin", arrayBuffer: async () => espBinary.buffer
+});
+assert.equal(espResult.family, 0x53335045);
+assert.equal(espResult.codeSize, espBinary.byteLength);
+assert.equal(espResult.binaryDigest.length, 32);
+await assert.rejects(context.parseEsp32Firmware({
+  name: "wrong.bin", arrayBuffer: async () => new Uint8Array(2048).buffer
+}), /ESP32-S3 firmware.bin/);
 for (const path of process.argv.slice(2)) {
   const bytes = Uint8Array.from(await readFile(path));
-  const result = await parse(bytes);
+  const result = path.endsWith(".bin")
+    ? await context.parseEsp32Firmware({ name: path, arrayBuffer: async () => bytes.buffer })
+    : await parse(bytes);
   console.log(`${path}: family=0x${result.family.toString(16)}, ${result.codeSize} bytes`);
 }
-console.log("UF2 architecture, payload, and rejection checks passed.");
+console.log("ESP32 binary and legacy UF2 firmware checks passed.");
