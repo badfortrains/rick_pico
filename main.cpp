@@ -55,9 +55,12 @@ static_assert(POLICY_OUTPUT_DIM == 2 * ACTION_DIM,
 
 // ESP32-S3-Zero carrier-board wiring.
 constexpr int PIN_STATUS_LED = 21;
+constexpr int PIN_BATTERY_ADC = 1;  // J2 pin 4, ESP32-S3 ADC1 channel 0.
 constexpr int PIN_IMU_SDA = 2;
 constexpr int PIN_IMU_SCL = 4;
 constexpr int PIN_IMU_INT1 = 5;
+constexpr uint32_t BATTERY_DIVIDER_RATIO = 3;  // 200 kOhm / 100 kOhm divider.
+constexpr int BATTERY_ADC_SAMPLES = 8;
 
 // MuJoCo actuator order: left roll/upper/lower/foot, then right equivalents.
 constexpr int SERVO_PINS[ACTION_DIM] = {6, 7, 8, 9, 10, 11, 12, 13};
@@ -77,8 +80,8 @@ constexpr float SERVO_DIRS[ACTION_DIM] = {
     1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
 };
 float SERVO_CENTERS_US[ACTION_DIM] = {
-    1595.0f, 1565.0f, 1700.0f, 1500.0f,
-    1455.0f, 1545.0f, 1590.0f, 1560.0f,
+    1645.0f, 1595.0f, 1615.0f, 1550.0f,
+    1350.0f, 1435.0f, 1500.0f, 1480.0f,
 };
 
 constexpr float SERVO_US_PER_RAD = 1000.0f / (PI_F / 2.0f);
@@ -204,8 +207,32 @@ constexpr char SERVO_UUID[] = "7e57a004-4c91-4d8e-8f2a-7dca6d5a1000";
 constexpr char OTA_CONTROL_UUID[] = "7e57a005-4c91-4d8e-8f2a-7dca6d5a1000";
 constexpr char OTA_DATA_UUID[] = "7e57a006-4c91-4d8e-8f2a-7dca6d5a1000";
 constexpr char OTA_STATUS_UUID[] = "7e57a007-4c91-4d8e-8f2a-7dca6d5a1000";
+constexpr char BATTERY_UUID[] = "7e57a008-4c91-4d8e-8f2a-7dca6d5a1000";
 
 uint64_t time_us_64() { return static_cast<uint64_t>(esp_timer_get_time()); }
+
+uint16_t read_battery_voltage_mv() {
+    // Discard one conversion so the ADC sample-and-hold can settle through the
+    // divider, then average calibrated millivolt readings to reduce noise.
+    analogReadMilliVolts(PIN_BATTERY_ADC);
+    uint32_t adc_mv_sum = 0;
+    for (int i = 0; i < BATTERY_ADC_SAMPLES; ++i) {
+        adc_mv_sum += analogReadMilliVolts(PIN_BATTERY_ADC);
+    }
+    const uint32_t battery_mv =
+        (adc_mv_sum * BATTERY_DIVIDER_RATIO + BATTERY_ADC_SAMPLES / 2) /
+        BATTERY_ADC_SAMPLES;
+    return static_cast<uint16_t>(std::min<uint32_t>(battery_mv, 0xffffu));
+}
+
+void init_battery_monitor() {
+    pinMode(PIN_BATTERY_ADC, INPUT);
+    analogReadResolution(12);
+    // A 4.2 V cell produces about 1.4 V after the divider, which fits 6 dB.
+    analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_6db);
+    printf("Battery monitor ready on GPIO%d: %.3f V.\n", PIN_BATTERY_ADC,
+           read_battery_voltage_mv() / 1000.0f);
+}
 
 void madgwick_update_6dof(
     float gx, float gy, float gz, float ax, float ay, float az, float dt) {
@@ -572,11 +599,12 @@ void process_ota_abort_request(){if(!ota_abort_requested)return;ota_abort_reques
 void set_value(BLECharacteristic *characteristic,const uint8_t *data,size_t length){
     characteristic->setValue(const_cast<uint8_t*>(data),length);}
 class RickCharacteristicCallbacks:public BLECharacteristicCallbacks{
-public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS};
+public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY};
     explicit RickCharacteristicCallbacks(Kind kind):kind_(kind){}
     void onRead(BLECharacteristic *c)override{
         if(kind_==Kind::CONTROL){const uint8_t state=control_state;set_value(c,&state,1);}
         else if(kind_==Kind::IMU){uint8_t b[12];for(int i=0;i<6;++i){const uint16_t v=imu_telemetry[i];b[2*i]=v;b[2*i+1]=v>>8;}set_value(c,b,sizeof(b));}
+        else if(kind_==Kind::BATTERY){const uint16_t v=read_battery_voltage_mv();const uint8_t b[2]={uint8_t(v),uint8_t(v>>8)};set_value(c,b,sizeof(b));}
         else if(kind_==Kind::SERVO){uint8_t b[ACTION_DIM*2];for(int i=0;i<ACTION_DIM;++i){const uint16_t v=std::lround(SERVO_CENTERS_US[i]);b[2*i]=v;b[2*i+1]=v>>8;}set_value(c,b,sizeof(b));}
         else if(kind_==Kind::OTA_STATUS){uint8_t b[32]={OTA_PROTOCOL_VERSION,uint8_t(ota_state),uint8_t(ota_error),ota_target_partition};
             write_u32(&b[4],ota_bytes_received);write_u32(&b[8],ota_total_bytes);write_u32(&b[12],ota_chunks_received);
@@ -611,6 +639,7 @@ bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *se
     create_characteristic(service,OTA_CONTROL_UUID,BLECharacteristic::PROPERTY_WRITE,ESP_GATT_PERM_WRITE_ENCRYPTED,RickCharacteristicCallbacks::Kind::OTA_CONTROL);
     create_characteristic(service,OTA_DATA_UUID,BLECharacteristic::PROPERTY_WRITE,ESP_GATT_PERM_WRITE_ENCRYPTED,RickCharacteristicCallbacks::Kind::OTA_DATA);
     create_characteristic(service,OTA_STATUS_UUID,BLECharacteristic::PROPERTY_READ,ESP_GATT_PERM_READ,RickCharacteristicCallbacks::Kind::OTA_STATUS);
+    create_characteristic(service,BATTERY_UUID,BLECharacteristic::PROPERTY_READ,ESP_GATT_PERM_READ,RickCharacteristicCallbacks::Kind::BATTERY);
     service->start();auto *security=new BLESecurity();security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
     security->setCapability(ESP_IO_CAP_NONE);security->setKeySize(16);
     security->setInitEncryptionKey(esp_ble_key_type_t(ESP_BLE_ENC_KEY_MASK|ESP_BLE_ID_KEY_MASK));
@@ -621,6 +650,7 @@ bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *se
 void setup(){neopixelWrite(PIN_STATUS_LED, 16, 16, 16);Serial.begin(115200);delay(250);printf("\nStarting Rick ESP32-S3 policy checkpoint %u (%d obs, %d actions)...\n",
     unsigned(POLICY_CHECKPOINT_STEP),OBS_DIM,ACTION_DIM);printf("Controller: ESP32-S3 LX7 at %u MHz, target period=%lu us.\n",
     getCpuFrequencyMhz(),static_cast<unsigned long>(CONTROL_PERIOD_US));
+    init_battery_monitor();
     control_command_queue=xQueueCreate(8,sizeof(uint8_t));servo_calibration_command_queue=xQueueCreate(8,sizeof(ServoCalibrationCommand));
     ota_control_queue=xQueueCreate(4,sizeof(OtaControlPacket));ota_data_queue=xQueueCreate(8,sizeof(OtaDataPacket));
     if(!control_command_queue||!servo_calibration_command_queue||!ota_control_queue||!ota_data_queue){printf("Could not allocate command queues.\n");abort();}

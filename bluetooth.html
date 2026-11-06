@@ -140,6 +140,20 @@
       font-weight: 720;
     }
 
+    .battery-status {
+      padding: 4px 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font: 700 0.68rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: nowrap;
+    }
+
+    .battery-status.live {
+      border-color: rgba(85, 209, 135, 0.35);
+      color: var(--green);
+    }
+
     .status-detail {
       overflow: hidden;
       margin-top: 5px;
@@ -568,6 +582,7 @@
             <div class="status-line">
               <span class="dot" id="statusDot" aria-hidden="true"></span>
               <span id="statusText">Not connected</span>
+              <output class="battery-status" id="batteryVoltage" title="Battery voltage">BAT —</output>
             </div>
             <div class="status-detail" id="statusDetail">Pair with RickBot to enable controls</div>
           </div>
@@ -703,6 +718,7 @@
     const OTA_CONTROL_UUID = "7e57a005-4c91-4d8e-8f2a-7dca6d5a1000";
     const OTA_DATA_UUID = "7e57a006-4c91-4d8e-8f2a-7dca6d5a1000";
     const OTA_STATUS_UUID = "7e57a007-4c91-4d8e-8f2a-7dca6d5a1000";
+    const BATTERY_UUID = "7e57a008-4c91-4d8e-8f2a-7dca6d5a1000";
 
     const OTA_PROTOCOL_VERSION_LEGACY = 1;
     const OTA_PROTOCOL_VERSION_COMPACT = 2;
@@ -771,6 +787,7 @@
     const statusDot = document.getElementById("statusDot");
     const statusText = document.getElementById("statusText");
     const statusDetail = document.getElementById("statusDetail");
+    const batteryVoltage = document.getElementById("batteryVoltage");
     const message = document.getElementById("message");
     const commandButtons = [...document.querySelectorAll("[data-command]")];
     const imuStatus = document.getElementById("imuStatus");
@@ -799,6 +816,7 @@
     let otaControlCharacteristic = null;
     let otaDataCharacteristic = null;
     let otaStatusCharacteristic = null;
+    let batteryCharacteristic = null;
     let otaProtocolVersion = null;
     let busy = false;
     let otaUpdating = false;
@@ -807,9 +825,11 @@
     let expectedBootPartition = null;
     let selectedFirmware = null;
     let imuReadPending = false;
+    let batteryReadPending = false;
     let imuPollTimer = null;
     let gattOperationQueue = Promise.resolve();
     let lastImuReadAt = 0;
+    let lastBatteryReadAt = 0;
     let accelerometer = [0, 0, 0];
     let servoCenters = Array(servoNames.length).fill(null);
     const verifiedAxes = new Set();
@@ -1024,17 +1044,43 @@
       }
     }
 
+    async function readBatteryVoltage() {
+      if (!batteryCharacteristic || batteryReadPending) return;
+      batteryReadPending = true;
+      try {
+        const characteristic = batteryCharacteristic;
+        const value = await queueGattOperation(() => characteristic.readValue());
+        if (value.byteLength < 2) throw new Error("Battery response was incomplete");
+        const millivolts = value.getUint16(0, true);
+        batteryVoltage.textContent = `BAT ${(millivolts / 1000).toFixed(2)} V`;
+        batteryVoltage.title = `Battery voltage: ${(millivolts / 1000).toFixed(3)} V`;
+        batteryVoltage.classList.add("live");
+      } catch (error) {
+        batteryVoltage.textContent = "BAT ERR";
+        batteryVoltage.title = error.message || "Battery voltage read failed";
+        batteryVoltage.classList.remove("live");
+      } finally {
+        lastBatteryReadAt = Date.now();
+        batteryReadPending = false;
+      }
+    }
+
     function stopImuPolling() {
       if (imuPollTimer !== null) window.clearInterval(imuPollTimer);
       imuPollTimer = null;
       imuReadPending = false;
+      batteryReadPending = false;
     }
 
     function startImuPolling() {
       stopImuPolling();
       readImuTelemetry();
+      readBatteryVoltage();
       imuPollTimer = window.setInterval(() => {
-        if (isConnected() && !busy) readImuTelemetry();
+        if (isConnected() && !busy) {
+          readImuTelemetry();
+          if (Date.now() - lastBatteryReadAt >= 1000) readBatteryVoltage();
+        }
       }, 250);
     }
 
@@ -1466,6 +1512,15 @@
         imuCharacteristic = await service.getCharacteristic(IMU_UUID);
         servoCharacteristic = await service.getCharacteristic(SERVO_UUID);
         try {
+          batteryCharacteristic = await service.getCharacteristic(BATTERY_UUID);
+        } catch (error) {
+          // Older firmware remains fully usable without battery telemetry.
+          batteryCharacteristic = null;
+          batteryVoltage.textContent = "BAT —";
+          batteryVoltage.title = "Battery telemetry requires updated firmware";
+          batteryVoltage.classList.remove("live");
+        }
+        try {
           [
             otaControlCharacteristic,
             otaDataCharacteristic,
@@ -1494,6 +1549,7 @@
           await readRobotState();
           await readServoCenters();
           await readImuTelemetry();
+          await readBatteryVoltage();
           if (otaIsAvailable()) {
             const otaStatus = await readOtaStatus();
             otaProtocolVersion = otaStatus.protocolVersion;
@@ -1571,6 +1627,7 @@
         otaControlCharacteristic = null;
         otaDataCharacteristic = null;
         otaStatusCharacteristic = null;
+        batteryCharacteristic = null;
         otaProtocolVersion = null;
         if (device?.gatt?.connected) device.gatt.disconnect();
 
@@ -1599,12 +1656,17 @@
       otaControlCharacteristic = null;
       otaDataCharacteristic = null;
       otaStatusCharacteristic = null;
+      batteryCharacteristic = null;
       otaProtocolVersion = null;
       busy = false;
       otaUpdating = false;
       otaCancelRequested = false;
       otaCommitSent = false;
       lastImuReadAt = 0;
+      lastBatteryReadAt = 0;
+      batteryVoltage.textContent = "BAT —";
+      batteryVoltage.title = "Battery voltage";
+      batteryVoltage.classList.remove("live");
       accelerometer = [0, 0, 0];
       [0, 1, 2].forEach((index) => {
         document.getElementById(`accel${index}`).textContent = "— g";

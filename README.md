@@ -112,6 +112,7 @@ The controller provides:
 - reset every servo to its raw calibrated center pulse;
 - start and stop policy inference;
 - live physical-frame accelerometer and gyro checks;
+- live battery-voltage monitoring from GPIO1 / ADC1 through the 3:1 divider;
 - live servo-center calibration;
 - encrypted wireless firmware updates.
 
