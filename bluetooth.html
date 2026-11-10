@@ -654,6 +654,36 @@
       <p class="tool-note" id="imuResult" role="status">Connect to begin reading the IMU.</p>
     </section>
 
+    <section class="card tool-card" aria-labelledby="rawHeading">
+      <div class="tool-heading">
+        <div><h2 id="rawHeading">IMU raw-count test</h2>
+          <p>Compare sensor response at ±2, ±4, and ±8 g.</p></div>
+        <span class="tool-status" id="rawProgress">0 / 6 POSES</span>
+      </div>
+      <p class="tool-note">Support Rick and turn the whole body into the selected pose. Capture stops the policy and holds the current servo pose. Keep still for about four seconds, until the capture finishes.</p>
+      <label class="step-control" for="rawPose">Pose
+        <select id="rawPose">
+          <option value="1">Upright — feet down</option>
+          <option value="2">Upside down — feet up</option>
+          <option value="3">Rick's left side down (your right when facing Rick)</option>
+          <option value="4">Rick's right side down (your left when facing Rick)</option>
+          <option value="5">Front down</option>
+          <option value="6">Back down</option>
+        </select>
+      </label>
+      <div class="axis-checks">
+        <button class="small-button" id="rawCapture" type="button" disabled>Capture pose</button>
+        <button class="small-button" id="rawCheckSupport" type="button" disabled>Check test support</button>
+        <button class="small-button" id="rawCancel" type="button" disabled>Cancel capture</button>
+        <button class="small-button" id="rawCopy" type="button" disabled>Copy results</button>
+        <button class="small-button" id="rawClear" type="button" disabled>Clear results</button>
+      </div>
+      <p class="tool-note" id="rawStatus" role="status" aria-live="polite">Connect to check raw-test support. Older firmware can be updated using the uploader above.</p>
+      <label for="rawOutput" class="tool-note">Results (CSV; uncalibrated counts)</label>
+      <textarea id="rawOutput" readonly rows="8" spellcheck="false" style="width:100%;box-sizing:border-box;font-family:monospace;font-size:12px;margin-top:8px" placeholder="Completed poses appear here. Copy results before reloading the page."></textarea>
+      <p class="tool-note">Opposite poses should differ by about 32768 / 16384 / 8192 counts at ±2 / ±4 / ±8 g. The normal ±4 g setting is restored after every capture. Bluetooth updates remain available.</p>
+    </section>
+
     <section class="card tool-card" aria-labelledby="servoHeading">
       <div class="tool-heading">
         <div>
@@ -719,6 +749,7 @@
     const OTA_DATA_UUID = "7e57a006-4c91-4d8e-8f2a-7dca6d5a1000";
     const OTA_STATUS_UUID = "7e57a007-4c91-4d8e-8f2a-7dca6d5a1000";
     const BATTERY_UUID = "7e57a008-4c91-4d8e-8f2a-7dca6d5a1000";
+    const IMU_RAW_UUID = "7e57a009-4c91-4d8e-8f2a-7dca6d5a1000";
 
     const OTA_PROTOCOL_VERSION_LEGACY = 1;
     const OTA_PROTOCOL_VERSION_COMPACT = 2;
@@ -808,6 +839,21 @@
     const installFirmware = document.getElementById("installFirmware");
     const abortFirmware = document.getElementById("abortFirmware");
     const bluetoothSupported = "bluetooth" in navigator;
+    const rawPose = document.getElementById("rawPose");
+    const rawCaptureButton = document.getElementById("rawCapture");
+    const rawCheckSupportButton = document.getElementById("rawCheckSupport");
+    const rawCancelButton = document.getElementById("rawCancel");
+    const rawCopyButton = document.getElementById("rawCopy");
+    const rawClearButton = document.getElementById("rawClear");
+    const rawStatus = document.getElementById("rawStatus");
+    const rawProgress = document.getElementById("rawProgress");
+    const rawOutput = document.getElementById("rawOutput");
+    const rawResults = new Map();
+    let rawCharacteristic = null;
+    let rawInProgress = false;
+    let rawCancelRequested = false;
+    let rawRun = 0;
+    let rawToken = Math.floor(Math.random() * 65536);
 
     let device = null;
     let controlCharacteristic = null;
@@ -970,7 +1016,7 @@
       });
       finishCalibration.disabled = locked || centeredServos.size !== servoNames.length;
       copyCenters.disabled = busy;
-      connectButton.disabled = busy || !bluetoothSupported;
+      connectButton.disabled = (busy && !rawInProgress) || !bluetoothSupported;
       connectButton.textContent = isConnected() ? "Disconnect" : "Pair & connect";
       firmwareFileInput.disabled =
         !otaIsAvailable() || otaProtocolVersion === null || busy;
@@ -979,6 +1025,15 @@
         !selectedFirmware || busy || otaUpdating;
       abortFirmware.hidden = !otaUpdating;
       abortFirmware.disabled = !otaUpdating || !isConnected();
+      rawCaptureButton.disabled = locked || !rawCharacteristic;
+      rawCheckSupportButton.disabled = locked;
+      rawCaptureButton.title = !isConnected() ? "Connect to RickBot first" :
+        busy ? "Wait for the current operation to finish" :
+        !rawCharacteristic ? "Raw-test support was not found. Check support or update Rick's firmware." : "";
+      rawPose.disabled = locked || !rawCharacteristic;
+      rawCancelButton.disabled = !rawInProgress || !isConnected();
+      rawCopyButton.disabled = rawResults.size === 0;
+      rawClearButton.disabled = rawInProgress || rawResults.size === 0;
     }
 
     function showConnection(status, detail, mode = "") {
@@ -1017,6 +1072,173 @@
       servoCenters = servoNames.map((_, index) => value.getUint16(index * 2, true));
       renderServoState();
       return servoCenters;
+    }
+
+    async function discoverRawSupport(service) {
+      rawCharacteristic = null;
+      rawStatus.title = "";
+      try {
+        rawCharacteristic = await queueGattOperation(() => service.getCharacteristic(IMU_RAW_UUID));
+        rawStatus.textContent = "Ready. Choose a pose, hold Rick still, and capture.";
+        return true;
+      } catch (error) {
+        rawStatus.title = `${error.name || "Bluetooth error"}: ${error.message || error}`;
+        rawStatus.textContent = "Connected, but raw-test support was not found. Upload build/rick-imu-bluetooth.bin using Firmware update, then reconnect. If you already installed it, forget RickBot in your computer's Bluetooth settings and pair again. " + rawStatus.title;
+        return false;
+      }
+    }
+
+    async function checkRawSupport() {
+      if (!isConnected() || busy) return;
+      busy = true;
+      stopImuPolling();
+      rawStatus.textContent = "Checking Rick's raw-test support…";
+      updateButtons();
+      try {
+        const service = await queueGattOperation(() => device.gatt.getPrimaryService(SERVICE_UUID));
+        await discoverRawSupport(service);
+      } catch (error) {
+        rawCharacteristic = null;
+        rawStatus.textContent = `Could not check support: ${error.message || error}. Disconnect and reconnect RickBot.`;
+      } finally {
+        busy = false;
+        updateButtons();
+        if (isConnected()) startImuPolling();
+      }
+    }
+
+    function decodeRawCapture(value) {
+      if (value.byteLength !== 96 || value.getUint8(0) !== 1) {
+        throw new Error("Unsupported raw-test response. Reload the updated controller page.");
+      }
+      const result = {
+        state: value.getUint8(1), error: value.getUint8(2), pose: value.getUint8(3),
+        token: value.getUint16(4, true), completed: value.getUint8(6),
+        samples: value.getUint8(7), range: value.getUint8(8),
+        restoreFailed: Boolean(value.getUint8(9)), rows: []
+      };
+      if (result.state > 4 || result.completed > 3 || result.pose > 6) {
+        throw new Error("Invalid raw-test response");
+      }
+      for (let i = 0; i < result.completed; i++) {
+        const offset = 12 + 28 * i;
+        const samples = value.getUint8(offset + 2);
+        if (samples !== 50 || value.getUint8(offset) !== (2 << i) ||
+            value.getUint8(offset + 1) !== ((i << 4) | 3)) {
+          throw new Error("Incomplete raw-test samples or unexpected range readback");
+        }
+        const sensor = [0, 1, 2].map(axis => value.getInt32(offset + 4 + 4 * axis, true) / samples);
+        const minimum = [0, 1, 2].map(axis => value.getInt16(offset + 16 + 2 * axis, true));
+        const maximum = [0, 1, 2].map(axis => value.getInt16(offset + 22 + 2 * axis, true));
+        result.rows.push({ range: value.getUint8(offset), config: value.getUint8(offset + 1),
+          samples, clipped: value.getUint8(offset + 3), sensor,
+          robot: [-sensor[2], sensor[0], -sensor[1]],
+          span: maximum.map((v, axis) => v - minimum[axis]) });
+      }
+      if (result.state === 2 && (result.completed !== 3 || result.error || result.restoreFailed)) {
+        throw new Error("Raw capture did not finish successfully");
+      }
+      return result;
+    }
+
+    function rawCaptureCsv(captures) {
+      const names = ["", "upright", "upside_down", "left_down", "right_down", "front_down", "back_down"];
+      const lines = ["pose,range_g,reg21,samples,sensor_x,sensor_y,sensor_z,robot_x,robot_y,robot_z,span_x,span_y,span_z,clipped"];
+      for (const [pose, rows] of [...captures].sort((a, b) => a[0] - b[0])) {
+        for (const row of rows) lines.push([
+          names[pose], row.range, `0x${row.config.toString(16).padStart(2, "0")}`, row.samples,
+          ...row.sensor.map(v => v.toFixed(1)), ...row.robot.map(v => v.toFixed(1)),
+          ...row.span, row.clipped
+        ].join(","));
+      }
+      return lines.join("\n");
+    }
+
+    function renderRawResults() {
+      rawOutput.value = rawResults.size ? rawCaptureCsv(rawResults) : "";
+      rawProgress.textContent = `${rawResults.size} / 6 POSES`;
+      updateButtons();
+    }
+
+    async function captureRawPose() {
+      if (!isConnected() || busy || !rawCharacteristic) return;
+      const characteristic = rawCharacteristic;
+      const pose = Number(rawPose.value);
+      const run = ++rawRun;
+      const token = rawToken = (rawToken + 1) & 65535;
+      rawInProgress = true;
+      rawCancelRequested = false;
+      busy = true;
+      stopImuPolling();
+      imuStatus.textContent = "RAW TEST";
+      rawStatus.textContent = "Keep the whole robot still. Starting capture…";
+      updateButtons();
+      try {
+        const previous = decodeRawCapture(await queueGattOperation(() => characteristic.readValue()));
+        if (previous.restoreFailed) throw new Error("Sensor range could not be restored. Restart Rick before retrying.");
+        if (previous.state === 1) throw new Error("A capture is already running. Wait a few seconds and retry.");
+        if (run !== rawRun) return;
+        if (rawCancelRequested) {
+          rawStatus.textContent = "Capture cancelled before sampling started.";
+          return;
+        }
+        await writeWithResponse(characteristic, Uint8Array.of(1, token & 255, token >> 8, pose));
+        const deadline = Date.now() + 15000;
+        while (Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+          if (run !== rawRun || !isConnected()) throw new Error("Disconnected during capture. Repeat this pose after reconnecting.");
+          const result = decodeRawCapture(await queueGattOperation(() => characteristic.readValue()));
+          if (run !== rawRun) return;
+          if (result.token !== token || result.pose !== pose) continue;
+          if (result.state === 3) {
+            const errors = ["Unknown error", "Sensor read failed", "Range register readback failed", "Normal sensor range could not be restored; restart Rick"];
+            throw new Error(errors[result.error] || "Sensor capture failed");
+          }
+          if (result.state === 4) {
+            rawStatus.textContent = "Capture cancelled. Normal sensor range restored; policy remains stopped.";
+            return;
+          }
+          if (result.state === 2) {
+            rawResults.set(pose, result.rows);
+            renderRawResults();
+            const clipped = result.rows.some(row => row.clipped);
+            rawStatus.textContent = `${rawPose.options[rawPose.selectedIndex].text}: captured. ${clipped ? "Clipping detected; keep these results for diagnosis. " : ""}You can move Rick now. Normal range restored; policy remains stopped.`;
+            const next = [1, 2, 3, 4, 5, 6].find(value => !rawResults.has(value));
+            if (next) rawPose.value = String(next);
+            showRobotState(3);
+            return;
+          }
+          rawStatus.textContent = `Keep still: ±${result.range} g · ${result.samples}/50 samples · ${result.completed}/3 ranges complete`;
+        }
+        throw new Error("Capture timed out. Reconnect and repeat this pose.");
+      } catch (error) {
+        if (run === rawRun) rawStatus.textContent = error.message || String(error);
+        // Best effort cancellation; disconnect also cancels on the firmware.
+        if (run === rawRun && isConnected()) {
+          try { await writeWithResponse(characteristic, Uint8Array.of(1, token & 255, token >> 8, 0)); }
+          catch (_) { /* The sensor capture is bounded even if the link fails. */ }
+        }
+      } finally {
+        if (run === rawRun) {
+          rawInProgress = false;
+          busy = false;
+          updateButtons();
+          if (isConnected()) startImuPolling();
+        }
+      }
+    }
+
+    async function cancelRawPose() {
+      if (!rawInProgress || !isConnected() || !rawCharacteristic) return;
+      rawCancelRequested = true;
+      rawCancelButton.disabled = true;
+      try {
+        await writeWithResponse(rawCharacteristic, Uint8Array.of(1, rawToken & 255, rawToken >> 8, 0));
+        rawStatus.textContent = "Cancelling capture…";
+      } catch (error) {
+        rawStatus.textContent = `Cancel failed: ${error.message}. Disconnect to stop the capture.`;
+        rawCancelButton.disabled = false;
+      }
     }
 
     async function readImuTelemetry() {
@@ -1511,6 +1733,7 @@
         controlCharacteristic = await service.getCharacteristic(CONTROL_UUID);
         imuCharacteristic = await service.getCharacteristic(IMU_UUID);
         servoCharacteristic = await service.getCharacteristic(SERVO_UUID);
+        await discoverRawSupport(service);
         try {
           batteryCharacteristic = await service.getCharacteristic(BATTERY_UUID);
         } catch (error) {
@@ -1622,6 +1845,7 @@
         }
       } catch (error) {
         controlCharacteristic = null;
+        rawCharacteristic = null;
         imuCharacteristic = null;
         servoCharacteristic = null;
         otaControlCharacteristic = null;
@@ -1646,6 +1870,11 @@
     }
 
     function handleDisconnect() {
+      if (rawInProgress) rawStatus.textContent = "Disconnected during capture. Previous results are kept; repeat this pose after reconnecting.";
+      else rawStatus.textContent = "Disconnected. Captured results are kept until the page is reloaded or cleared.";
+      ++rawRun;
+      rawInProgress = false;
+      rawCharacteristic = null;
       const expectedFirmwareReboot = otaCommitSent;
       const interruptedFirmwareUpdate = otaUpdating && !otaCommitSent;
       stopImuPolling();
@@ -1872,6 +2101,22 @@
     });
 
     finishCalibration.addEventListener("click", finishServoCalibration);
+    rawCaptureButton.addEventListener("click", captureRawPose);
+    rawCheckSupportButton.addEventListener("click", checkRawSupport);
+    rawCancelButton.addEventListener("click", cancelRawPose);
+    rawCopyButton.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(rawOutput.value);
+        rawStatus.textContent = "Results copied. Paste them into the chat.";
+      } catch (_) {
+        rawOutput.focus(); rawOutput.select();
+        rawStatus.textContent = "Results selected. Use your browser's Copy command.";
+      }
+    });
+    rawClearButton.addEventListener("click", () => {
+      rawResults.clear(); renderRawResults();
+      rawStatus.textContent = "Results cleared. Choose a pose for a new test.";
+    });
     copyCenters.addEventListener("click", copyServoCenters);
     firmwareFileInput.addEventListener("change", chooseFirmware);
     installFirmware.addEventListener("click", installSelectedFirmware);

@@ -21,6 +21,9 @@
 
 #include "control_timing.h"
 #include "heading_control.h"
+#include "imu_axes.h"
+#include "imu_calibration.h"
+#include "imu_raw_capture.h"
 #include "policy_inference.h"
 
 // Route diagnostics through native USB CDC instead of the exposed UART0 pins.
@@ -110,7 +113,8 @@ constexpr uint8_t IMU_ODR_110_HZ = 0x03;
 constexpr uint8_t IMU_ACCEL_RANGE_4G = 0x10;
 constexpr uint8_t IMU_GYRO_RANGE_2000_DPS = 0x60;
 constexpr float GYRO_SCALE_RAD_S = (1.0f / 16.4f) * (PI_F / 180.0f);
-constexpr float ACCEL_SCALE_G = 4.0f / 32768.0f;
+static_assert(IMU_ACCEL_RANGE_4G == 0x10 && rick::IMU_CALIBRATION_RANGE_G == 4.0f,
+              "Measured accelerometer calibration requires the +/-4 g setting");
 
 float current_obs[OBS_DIM] = {0.0f};
 float target_actions[ACTION_DIM] = {0.0f};
@@ -144,6 +148,11 @@ constexpr uint8_t CONTROL_STATE_CALIBRATING = 4;
 
 QueueHandle_t control_command_queue = nullptr;
 QueueHandle_t servo_calibration_command_queue = nullptr;
+struct ImuRawCommand { uint16_t token; uint8_t pose; };
+QueueHandle_t imu_raw_command_queue = nullptr;
+rick::ImuRawCapture imu_raw_capture;
+portMUX_TYPE imu_raw_mutex = portMUX_INITIALIZER_UNLOCKED;
+uint8_t imu_raw_packet[rick::ImuRawCapture::PACKET_SIZE] = {1};
 volatile uint8_t control_state = CONTROL_STATE_DEFAULT;
 volatile bool stop_requested = false;
 bool robot_running = false;
@@ -208,6 +217,7 @@ constexpr char OTA_CONTROL_UUID[] = "7e57a005-4c91-4d8e-8f2a-7dca6d5a1000";
 constexpr char OTA_DATA_UUID[] = "7e57a006-4c91-4d8e-8f2a-7dca6d5a1000";
 constexpr char OTA_STATUS_UUID[] = "7e57a007-4c91-4d8e-8f2a-7dca6d5a1000";
 constexpr char BATTERY_UUID[] = "7e57a008-4c91-4d8e-8f2a-7dca6d5a1000";
+constexpr char IMU_RAW_UUID[] = "7e57a009-4c91-4d8e-8f2a-7dca6d5a1000";
 
 uint64_t time_us_64() { return static_cast<uint64_t>(esp_timer_get_time()); }
 
@@ -228,8 +238,10 @@ uint16_t read_battery_voltage_mv() {
 void init_battery_monitor() {
     pinMode(PIN_BATTERY_ADC, INPUT);
     analogReadResolution(12);
-    // A 4.2 V cell produces about 1.4 V after the divider, which fits 6 dB.
-    analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_6db);
+    // The PCB uses a 2S pack: 8.4 V / 3 = 2.8 V at GPIO1. The 6 dB
+    // range clips above ~1.75 V; ADC_11db supports ~3.1 V on ESP32-S3
+    // (this Arduino core's name for the highest attenuation setting).
+    analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);
     printf("Battery monitor ready on GPIO%d: %.3f V.\n", PIN_BATTERY_ADC,
            read_battery_voltage_mv() / 1000.0f);
 }
@@ -320,6 +332,35 @@ bool read_imu_register(uint8_t reg, uint8_t &value) {
     return read_imu_registers(reg, &value, 1);
 }
 
+struct ImuRawIO {
+    bool configure(uint8_t value) { return write_imu_register(IMU_REG_ACC_CONFIG_1, value); }
+    bool config(uint8_t &value) { return read_imu_register(IMU_REG_ACC_CONFIG_1, value); }
+    bool read(int16_t values[3]) {
+        uint8_t bytes[6];
+        if (!read_imu_registers(IMU_REG_ACC_DATA_XL, bytes, sizeof(bytes))) return false;
+        for (int axis = 0; axis < 3; ++axis)
+            values[axis] = int16_t(uint16_t(bytes[2 * axis]) | (uint16_t(bytes[2 * axis + 1]) << 8));
+        return true;
+    }
+} imu_raw_io;
+
+void publish_imu_raw() {
+    uint8_t packet[rick::ImuRawCapture::PACKET_SIZE];
+    imu_raw_capture.encode(packet);
+    portENTER_CRITICAL(&imu_raw_mutex);
+    std::memcpy(imu_raw_packet, packet, sizeof(packet));
+    portEXIT_CRITICAL(&imu_raw_mutex);
+}
+void cancel_imu_raw() {
+    imu_raw_capture.cancel(imu_raw_io);
+    publish_imu_raw();
+    imu_clock.reset();
+    gyro_calibration.reset_window();
+}
+bool imu_raw_locks_robot() {
+    return imu_raw_capture.active() || imu_raw_capture.restore_failed;
+}
+
 bool init_imu() {
     Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL, 400000);
     Wire.setTimeOut(10);
@@ -389,16 +430,21 @@ bool read_imu(float *gx, float *gy, float *gz, float *ax, float *ay, float *az) 
     const int16_t raw_gy = static_cast<int16_t>(buffer[9]<<8 | buffer[8]);
     const int16_t raw_gz = static_cast<int16_t>(buffer[11]<<8 | buffer[10]);
     const float pgx=raw_gx*GYRO_SCALE_RAD_S, pgy=raw_gy*GYRO_SCALE_RAD_S;
-    const float pgz=raw_gz*GYRO_SCALE_RAD_S, pax=raw_ax*ACCEL_SCALE_G;
-    const float pay=raw_ay*ACCEL_SCALE_G, paz=raw_az*ACCEL_SCALE_G;
-    imu_telemetry[0]=clamp_to_int16(pax*1000); imu_telemetry[1]=clamp_to_int16(pay*1000);
-    imu_telemetry[2]=clamp_to_int16(paz*1000);
-    imu_telemetry[3]=clamp_to_int16(pgx*(1800/PI_F));
-    imu_telemetry[4]=clamp_to_int16(pgy*(1800/PI_F));
-    imu_telemetry[5]=clamp_to_int16(pgz*(1800/PI_F));
-    // Preserve the previous sensor-to-robot transform. Confirm the assembled
-    // Tokmas package orientation with Rick Control's IMU axis check.
-    *gx=pgx; *gy=-pgz; *gz=-pgy; *ax=pax; *ay=-paz; *az=-pay;
+    const float pgz=raw_gz*GYRO_SCALE_RAD_S;
+    const auto sensor_accel = rick::calibrated_sensor_accel(raw_ax, raw_ay, raw_az);
+    const rick::ImuVector3 robot_accel = rick::sensor_to_robot_axes(
+        sensor_accel.x, sensor_accel.y, sensor_accel.z);
+    const rick::ImuVector3 robot_gyro = rick::sensor_to_robot_axes(pgx, pgy, pgz);
+    imu_telemetry[0]=clamp_to_int16(robot_accel.x*1000);
+    imu_telemetry[1]=clamp_to_int16(robot_accel.y*1000);
+    imu_telemetry[2]=clamp_to_int16(robot_accel.z*1000);
+    imu_telemetry[3]=clamp_to_int16(robot_gyro.x*(1800/PI_F));
+    imu_telemetry[4]=clamp_to_int16(robot_gyro.y*(1800/PI_F));
+    imu_telemetry[5]=clamp_to_int16(robot_gyro.z*(1800/PI_F));
+    const rick::ImuVector3 policy_accel = rick::robot_to_policy_axes(robot_accel);
+    const rick::ImuVector3 policy_gyro = rick::robot_to_policy_axes(robot_gyro);
+    *gx=policy_gyro.x; *gy=policy_gyro.y; *gz=policy_gyro.z;
+    *ax=policy_accel.x; *ay=policy_accel.y; *az=policy_accel.z;
     return true;
 }
 
@@ -457,6 +503,7 @@ void print_servo_centers() {
     printf("};\n\n");
 }
 void apply_servo_calibration_command(const ServoCalibrationCommand &command) {
+    if (imu_raw_locks_robot()) return;
     if(command.servo_index==SERVO_CALIBRATION_FINISH){reset_servos(0);servo_calibration_active=false;
         control_state=CONTROL_STATE_DEFAULT;print_servo_centers();return;}
     if(command.servo_index>=ACTION_DIM)return;
@@ -468,6 +515,8 @@ void apply_servo_calibration_command(const ServoCalibrationCommand &command) {
            command.delta_us,SERVO_CENTERS_US[command.servo_index]);
 }
 void apply_control_command(ControlCommand command) {
+    if (command == ControlCommand::STOP) cancel_imu_raw();
+    else if (imu_raw_locks_robot()) return;
     servo_calibration_active=false;
     switch(command){
     case ControlCommand::RESET_DEFAULT: reset_servos(0);control_state=CONTROL_STATE_DEFAULT;
@@ -491,6 +540,7 @@ void apply_control_command(ControlCommand command) {
 template<typename T> void drain_queue(QueueHandle_t queue){T item;while(xQueueReceive(queue,&item,0)==pdTRUE){}}
 void process_control_commands(){
     if(stop_requested){stop_requested=false;drain_queue<uint8_t>(control_command_queue);
+        drain_queue<ImuRawCommand>(imu_raw_command_queue);
         drain_queue<ServoCalibrationCommand>(servo_calibration_command_queue);
         apply_control_command(ControlCommand::STOP);return;}
     uint8_t value;while(xQueueReceive(control_command_queue,&value,0)==pdTRUE)
@@ -499,6 +549,24 @@ void process_control_commands(){
 void process_servo_calibration_commands(){ServoCalibrationCommand command;
     while(xQueueReceive(servo_calibration_command_queue,&command,0)==pdTRUE)
         apply_servo_calibration_command(command);}
+void process_imu_raw_commands() {
+    ImuRawCommand command;
+    while (xQueueReceive(imu_raw_command_queue, &command, 0) == pdTRUE) {
+        if (command.pose == 0) {
+            if (command.token == imu_raw_capture.token) cancel_imu_raw();
+        } else if (!imu_raw_locks_robot()) {
+            robot_running = false;
+            servo_calibration_active = false;
+            control_state = CONTROL_STATE_STOPPED;
+            drain_queue<uint8_t>(control_command_queue);
+            drain_queue<ServoCalibrationCommand>(servo_calibration_command_queue);
+            imu_clock.reset();
+            gyro_calibration.reset_window();
+            imu_raw_capture.start(imu_raw_io, command.token, command.pose, time_us_64());
+            publish_imu_raw();
+        }
+    }
+}
 void update_imu_and_clock_observation(float gx,float gy,float gz){
     get_local_gravity(&current_obs[GRAVITY_OFFSET]);
     current_obs[GYRO_OFFSET]=POLICY_GYRO_OBS_SCALE*gx;
@@ -535,6 +603,7 @@ void ota_reset(){ota_abort_writer();ota_cleanup_hash();drain_queue<OtaDataPacket
     ota_digest_bytes_received=ota_total_bytes=ota_bytes_received=ota_chunks_received=0;
     ota_target_partition=0xff;ota_partition=nullptr;ota_error=OtaError::NONE;ota_state=OtaState::IDLE;}
 void stop_robot_for_update(){stop_requested=false;robot_running=false;servo_calibration_active=false;
+    cancel_imu_raw();drain_queue<ImuRawCommand>(imu_raw_command_queue);
     control_schedule.reset(time_us_64());control_state=CONTROL_STATE_STOPPED;
     drain_queue<uint8_t>(control_command_queue);drain_queue<ServoCalibrationCommand>(servo_calibration_command_queue);}
 void begin_ota_update(const OtaControlPacket &packet){
@@ -599,10 +668,13 @@ void process_ota_abort_request(){if(!ota_abort_requested)return;ota_abort_reques
 void set_value(BLECharacteristic *characteristic,const uint8_t *data,size_t length){
     characteristic->setValue(const_cast<uint8_t*>(data),length);}
 class RickCharacteristicCallbacks:public BLECharacteristicCallbacks{
-public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY};
+public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY,IMU_RAW};
     explicit RickCharacteristicCallbacks(Kind kind):kind_(kind){}
     void onRead(BLECharacteristic *c)override{
         if(kind_==Kind::CONTROL){const uint8_t state=control_state;set_value(c,&state,1);}
+        else if(kind_==Kind::IMU_RAW){uint8_t b[rick::ImuRawCapture::PACKET_SIZE];
+            portENTER_CRITICAL(&imu_raw_mutex);std::memcpy(b,imu_raw_packet,sizeof(b));portEXIT_CRITICAL(&imu_raw_mutex);
+            set_value(c,b,sizeof(b));}
         else if(kind_==Kind::IMU){uint8_t b[12];for(int i=0;i<6;++i){const uint16_t v=imu_telemetry[i];b[2*i]=v;b[2*i+1]=v>>8;}set_value(c,b,sizeof(b));}
         else if(kind_==Kind::BATTERY){const uint16_t v=read_battery_voltage_mv();const uint8_t b[2]={uint8_t(v),uint8_t(v>>8)};set_value(c,b,sizeof(b));}
         else if(kind_==Kind::SERVO){uint8_t b[ACTION_DIM*2];for(int i=0;i<ACTION_DIM;++i){const uint16_t v=std::lround(SERVO_CENTERS_US[i]);b[2*i]=v;b[2*i+1]=v>>8;}set_value(c,b,sizeof(b));}
@@ -612,6 +684,9 @@ public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY
                 uint8_t(running->subtype-ESP_PARTITION_SUBTYPE_APP_OTA_MIN):0xff;b[19]=1;write_u32(&b[28],ESP32_S3_FAMILY_ID);set_value(c,b,sizeof(b));}}
     void onWrite(BLECharacteristic *c)override{const std::string value=c->getValue();
         const auto *data=reinterpret_cast<const uint8_t*>(value.data());const size_t size=value.size();
+        if(kind_==Kind::IMU_RAW){if(ota_locks_robot()||size!=4||data[0]!=1||data[3]>6)return;
+            const ImuRawCommand command={uint16_t(uint16_t(data[1])|(uint16_t(data[2])<<8)),data[3]};
+            xQueueSend(imu_raw_command_queue,&command,0);return;}
         if(kind_==Kind::CONTROL){if(ota_locks_robot()||size!=1||data[0]>uint8_t(ControlCommand::STOP))return;
             if(data[0]==uint8_t(ControlCommand::STOP))stop_requested=true;else xQueueSend(control_command_queue,data,0);}
         else if(kind_==Kind::SERVO){if(ota_locks_robot()||size!=3)return;const int16_t delta=int16_t(uint16_t(data[1])|(uint16_t(data[2])<<8));
@@ -630,7 +705,7 @@ BLECharacteristic *create_characteristic(BLEService *service,const char *uuid,ui
     esp_gatt_perm_t permissions,RickCharacteristicCallbacks::Kind kind){auto *c=service->createCharacteristic(uuid,properties);
     c->setAccessPermissions(permissions);c->setCallbacks(new RickCharacteristicCallbacks(kind));return c;}
 bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *server=BLEDevice::createServer();
-    server->setCallbacks(new RickServerCallbacks());auto *service=server->createService(SERVICE_UUID);
+    server->setCallbacks(new RickServerCallbacks());auto *service=server->createService(BLEUUID(SERVICE_UUID),32);
     create_characteristic(service,CONTROL_UUID,BLECharacteristic::PROPERTY_READ|BLECharacteristic::PROPERTY_WRITE,
         esp_gatt_perm_t(ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE_ENCRYPTED),RickCharacteristicCallbacks::Kind::CONTROL);
     create_characteristic(service,IMU_UUID,BLECharacteristic::PROPERTY_READ,ESP_GATT_PERM_READ,RickCharacteristicCallbacks::Kind::IMU);
@@ -640,6 +715,8 @@ bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *se
     create_characteristic(service,OTA_DATA_UUID,BLECharacteristic::PROPERTY_WRITE,ESP_GATT_PERM_WRITE_ENCRYPTED,RickCharacteristicCallbacks::Kind::OTA_DATA);
     create_characteristic(service,OTA_STATUS_UUID,BLECharacteristic::PROPERTY_READ,ESP_GATT_PERM_READ,RickCharacteristicCallbacks::Kind::OTA_STATUS);
     create_characteristic(service,BATTERY_UUID,BLECharacteristic::PROPERTY_READ,ESP_GATT_PERM_READ,RickCharacteristicCallbacks::Kind::BATTERY);
+    create_characteristic(service,IMU_RAW_UUID,BLECharacteristic::PROPERTY_READ|BLECharacteristic::PROPERTY_WRITE,
+        esp_gatt_perm_t(ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE_ENCRYPTED),RickCharacteristicCallbacks::Kind::IMU_RAW);
     service->start();auto *security=new BLESecurity();security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
     security->setCapability(ESP_IO_CAP_NONE);security->setKeySize(16);
     security->setInitEncryptionKey(esp_ble_key_type_t(ESP_BLE_ENC_KEY_MASK|ESP_BLE_ID_KEY_MASK));
@@ -647,19 +724,26 @@ bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *se
     advertising->setMinPreferred(0x0c);advertising->setMaxPreferred(0x0c);BLEDevice::startAdvertising();
     printf("Bluetooth ready as RickBot. Waiting for Android.\n");return true;}
 
+#if defined(RICK_IMU_RAW_TEST) && RICK_IMU_RAW_TEST
+#include "imu_raw_diagnostic.h"
+#else
 void setup(){neopixelWrite(PIN_STATUS_LED, 16, 16, 16);Serial.begin(115200);delay(250);printf("\nStarting Rick ESP32-S3 policy checkpoint %u (%d obs, %d actions)...\n",
     unsigned(POLICY_CHECKPOINT_STEP),OBS_DIM,ACTION_DIM);printf("Controller: ESP32-S3 LX7 at %u MHz, target period=%lu us.\n",
     getCpuFrequencyMhz(),static_cast<unsigned long>(CONTROL_PERIOD_US));
     init_battery_monitor();
     control_command_queue=xQueueCreate(8,sizeof(uint8_t));servo_calibration_command_queue=xQueueCreate(8,sizeof(ServoCalibrationCommand));
+    imu_raw_command_queue=xQueueCreate(4,sizeof(ImuRawCommand));
     ota_control_queue=xQueueCreate(4,sizeof(OtaControlPacket));ota_data_queue=xQueueCreate(8,sizeof(OtaDataPacket));
-    if(!control_command_queue||!servo_calibration_command_queue||!ota_control_queue||!ota_data_queue){printf("Could not allocate command queues.\n");abort();}
+    if(!control_command_queue||!servo_calibration_command_queue||!imu_raw_command_queue||!ota_control_queue||!ota_data_queue){printf("Could not allocate command queues.\n");abort();}
     if(!init_imu()){printf("Tokmas ICM-42688-P initialization failed; servos remain disabled.\n");
         while(true)delay(1000);}
     init_servos();reset_servos(0);control_state=CONTROL_STATE_DEFAULT;
     printf("Servos at calibrated default pose; policy is stopped.\n");init_bluetooth();control_schedule.reset(time_us_64());}
 void loop(){process_ota_abort_request();process_ota_control_packets();process_ota_data_packets();
-    if(!ota_locks_robot()){process_control_commands();process_servo_calibration_commands();}
+    if(!ota_locks_robot()){process_control_commands();process_imu_raw_commands();process_servo_calibration_commands();}
+    if(imu_raw_locks_robot()){
+        imu_raw_capture.tick(imu_raw_io,time_us_64());publish_imu_raw();
+        control_schedule.reset(time_us_64());imu_clock.reset();delay(1);return;}
     const uint64_t now=time_us_64();if(ota_locks_robot()){control_schedule.reset(now);imu_clock.reset();}
     else{uint64_t skipped=0;if(control_schedule.take(now,skipped)){float gx,gy,gz,ax,ay,az;
         if(!read_imu(&gx,&gy,&gz,&ax,&ay,&az)){++imu_consecutive_read_errors;if((++imu_read_errors&0x3f)==1)printf("Tokmas IMU I2C read failed (%lu errors).\n",static_cast<unsigned long>(imu_read_errors));if(imu_consecutive_read_errors>=3)stop_requested=true;imu_clock.reset();delay(0);return;}imu_consecutive_read_errors=0;
@@ -674,3 +758,4 @@ void loop(){process_ota_abort_request();process_ota_control_packets();process_ot
             const uint64_t inference=time_us_64()-started;update_servos(target_actions);append_command_history(target_actions);++step_counter;
             const uint64_t finished=time_us_64();control_timing.record(now,finished,inference,skipped,control_schedule.next_us());report_control_timing(finished);}}}
     delay(0);}
+#endif

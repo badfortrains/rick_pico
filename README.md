@@ -24,15 +24,32 @@ the flash, PSRAM, USB CDC, and partition layout overridden in `platformio.ini`.
 | Tokmas ICM-42688-P | SDA | 2 |
 | Tokmas ICM-42688-P | SCL | 4 |
 | Tokmas ICM-42688-P | INT1 | 5 |
+| Battery sense | J2 pin 4 / BAT_ADC | 1 |
+
+Battery sensing measures the 2S pack through R15 + R16 (200 kOhm total)
+over R17 (100 kOhm), with C23 (100 nF) filtering. At a fully charged 8.4 V,
+GPIO1 sees 2.8 V. Use `ADC_11db` in the pinned Arduino core (about 3.1 V
+input range on ESP32-S3); `ADC_6db` clips and can produce a fixed reading
+around 5.5 V after the 3:1 scaling. The existing 250 ms startup delay exceeds
+the PCB's 50 ms settling requirement. After flashing, compare the displayed
+pack voltage with a multimeter; GPIO1 should measure about one third of it.
 
 The IMU is JLCPCB/LCSC part `C54308212`, uses the 7-bit I2C address `0x36`,
 and runs from 3.3 V. It is not register-compatible with the TDK part carrying
 the same ICM-42688-P name. Firmware follows the Tokmas quick-start sequence and
 checks its `0xA1` chip ID before enabling any servo outputs. INT1 is configured
 as an input but the 50 Hz controller currently polls the 110 Hz sensor stream.
-The sensor-to-robot axis transform is unchanged; verify it with the controller's
-IMU axis check because the assembled package orientation cannot be inferred
-from the connector pinout alone.
+The axis transform matches the installed PCB with its component side facing the
+robot's left, its servo bank facing forward, S1 above S8, and the power plug at
+the back/top. Bluetooth telemetry is right/down/forward; attitude estimation
+and policy observations are converted again to MuJoCo's right/back/up frame.
+
+`imu_calibration.h` applies the offset and sensitivity measured on this assembled
+Rick's accelerometer before both live telemetry and attitude estimation. At the
+normal +/-4 g setting, its effective sensitivity is about 4093 counts/g, with
+sensor-frame zero offsets around -7369/-6731/-7105 counts. These values are
+specific to this IMU, not general Tokmas defaults. The raw-count test bypasses
+this correction. See [the measurement and validation notes](IMU_RAW_TEST.md).
 
 GPIO21 is not used because it drives the ESP32-S3-Zero's onboard WS2812. The
 USB D-/D+ pins, GPIO19 and GPIO20, are also left free. The eight servos need an
@@ -138,6 +155,11 @@ rejected by the ESP32 protocol. The web controller retains its older UF2 parser
 only so it can still service robots running the prior Pico firmware.
 
 ## Verification
+
+For accelerometer offsets or suspicious sensitivity, use the
+[IMU raw-count test](IMU_RAW_TEST.md) in Rick Control. The normal firmware
+captures six poses at +/-2, +/-4, and +/-8 g over Bluetooth, then restores
+the normal sensor range. A separate USB-only diagnostic build is also available.
 
 Build the target and run the host regressions:
 

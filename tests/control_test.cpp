@@ -5,6 +5,7 @@
 
 #include "control_timing.h"
 #include "heading_control.h"
+#include "imu_axes.h"
 #include "policy_inference.h"
 
 // The pre-optimization deployment implementation is the numerical reference.
@@ -33,6 +34,18 @@ static void reference_policy(const float *obs, float *action) {
 }
 
 int main() {
+    // PCB installation: package +X/+Y/+Z point down/back/left. Telemetry is
+    // right/down/forward, while the policy consumes right/back/up.
+    constexpr rick::ImuVector3 package_x = rick::sensor_to_robot_axes(1, 0, 0);
+    constexpr rick::ImuVector3 package_y = rick::sensor_to_robot_axes(0, 1, 0);
+    constexpr rick::ImuVector3 package_z = rick::sensor_to_robot_axes(0, 0, 1);
+    static_assert(package_x.x == 0 && package_x.y == 1 && package_x.z == 0);
+    static_assert(package_y.x == 0 && package_y.y == 0 && package_y.z == -1);
+    static_assert(package_z.x == -1 && package_z.y == 0 && package_z.z == 0);
+    constexpr rick::ImuVector3 policy = rick::robot_to_policy_axes(
+        rick::sensor_to_robot_axes(1, 2, 3));
+    static_assert(policy.x == -3 && policy.y == 2 && policy.z == -1);
+
     // The IMU's -Y axis is forward; positive yaw rotates it toward +X.
     constexpr float pi = 3.14159265358979323846f;
     float heading_obs[2];
