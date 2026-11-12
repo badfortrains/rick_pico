@@ -622,6 +622,14 @@
             <small>Stop policy and hold pose</small>
           </span>
         </button>
+        <button class="command" data-command="4" type="button" disabled>
+          <span class="command-number">05</span>
+          <span><span class="command-label">Sleep</span><small>Release servos · disconnect Bluetooth</small></span>
+        </button>
+        <button class="command" data-command="5" type="button" disabled>
+          <span class="command-number">06</span>
+          <span><span class="command-label">Wake</span><small>Restore sensors · keep servos released</small></span>
+        </button>
       </div>
 
       <p class="message" id="message" role="status" aria-live="polite">Controls are locked until Bluetooth is connected.</p>
@@ -735,7 +743,7 @@
       <p class="tool-note">Updating immediately stops the policy and holds the current pose. Keep power connected until RickBot reboots; an interrupted upload leaves the current firmware bootable.</p>
     </section>
 
-    <p class="safety">Support the robot off the ground during calibration and first use. Keep people and cables clear before pressing Start. A Bluetooth disconnect stops the policy and holds the last pose.</p>
+    <p class="safety">Support the robot off the ground during calibration and first use. Keep people and cables clear before pressing Start. A Bluetooth disconnect stops active motion. Sleep releases the servos; lay Rick down or support it first. Reconnecting alone does not wake it.</p>
   </main>
 
   <script>
@@ -796,7 +804,7 @@
       "Left roll", "Left upper", "Left lower", "Left foot",
       "Right roll", "Right upper", "Right lower", "Right foot"
     ];
-    const servoPins = [6, 7, 8, 9, 10, 11, 12, 13];
+    const servoPins = [10, 11, 12, 13, 6, 7, 8, 9];
     const axisLabels = ["+X right", "+Y down", "+Z forward"];
 
     const stateLabels = [
@@ -804,14 +812,20 @@
       ["Servo centers", "Policy stopped · raw calibrated centers"],
       ["Running", "PPO policy active at 50 Hz"],
       ["Stopped", "Policy stopped · holding current pose"],
-      ["Calibrating", "Policy stopped · servos at adjusted centers"]
+      ["Calibrating", "Policy stopped · servos at adjusted centers"],
+      ["Sleeping", "Servos released · Wake required"],
+      ["Awake", "Servos released · choose a pose before Start"],
+      ["Sleeping · sensor fault", "Servos released · keep still and retry Wake"],
+      ["Waking", "Restoring sensor readings · servo pulses remain off"]
     ];
 
     const commandMessages = [
       "Reset to calibrated default pose.",
       "Reset every servo to its raw calibrated center.",
       "PPO policy started.",
-      "PPO policy stopped; holding the current pose."
+      "PPO policy stopped; holding the current pose.",
+      "RickBot is sleeping. Reconnect and press Wake when needed.",
+      "RickBot is awake. Servos remain released; choose a pose before Start."
     ];
 
     const connectButton = document.getElementById("connectButton");
@@ -865,6 +879,10 @@
     let batteryCharacteristic = null;
     let otaProtocolVersion = null;
     let busy = false;
+    let currentRobotState = null;
+    let sleepSupported = false;
+    let lastWakeError = 0;
+    function robotIsSleeping() { return currentRobotState === 5 || currentRobotState === 7 || currentRobotState === 8; }
     let otaUpdating = false;
     let otaCancelRequested = false;
     let otaCommitSent = false;
@@ -1009,8 +1027,14 @@
     }
 
     function updateButtons() {
-      const locked = !isConnected() || busy;
-      commandButtons.forEach((button) => { button.disabled = locked; });
+      const connectionLocked = !isConnected() || busy;
+      const locked = connectionLocked || robotIsSleeping();
+      commandButtons.forEach((button) => {
+        const command = Number(button.dataset.command);
+        button.disabled = connectionLocked ||
+          (command >= 4 && !sleepSupported) ||
+          (robotIsSleeping() ? command !== 5 : command === 5);
+      });
       document.querySelectorAll("[data-requires-connection]").forEach((control) => {
         control.disabled = locked;
       });
@@ -1022,7 +1046,7 @@
         !otaIsAvailable() || otaProtocolVersion === null || busy;
       installFirmware.disabled =
         !otaIsAvailable() || otaProtocolVersion === null ||
-        !selectedFirmware || busy || otaUpdating;
+        !selectedFirmware || busy || otaUpdating || robotIsSleeping();
       abortFirmware.hidden = !otaUpdating;
       abortFirmware.disabled = !otaUpdating || !isConnected();
       rawCaptureButton.disabled = locked || !rawCharacteristic;
@@ -1043,6 +1067,16 @@
     }
 
     function showRobotState(state) {
+      currentRobotState = state;
+      if (robotIsSleeping()) {
+        stopImuPolling();
+        imuStatus.textContent = "ASLEEP";
+        lastImuReadAt = 0;
+        for (let index = 0; index < 3; ++index) {
+          document.getElementById(`accel${index}`).textContent = "— g";
+          document.getElementById(`gyro${index}`).textContent = "— °/s";
+        }
+      }
       const label = stateLabels[state] || ["Connected", "Robot state unavailable"];
       showConnection(label[0], label[1], "connected");
     }
@@ -1058,7 +1092,10 @@
     async function readRobotState() {
       const characteristic = controlCharacteristic;
       const value = await queueGattOperation(() => characteristic.readValue());
+      if (value.byteLength < 1) throw new Error("Rick returned an empty control status. Reconnect and retry.");
       const state = value.getUint8(0);
+      sleepSupported = value.byteLength >= 2 && (value.getUint8(1) & 1) !== 0;
+      lastWakeError = value.byteLength >= 3 ? value.getUint8(2) : 0;
       showRobotState(state);
       return state;
     }
@@ -1296,10 +1333,11 @@
 
     function startImuPolling() {
       stopImuPolling();
+      if (robotIsSleeping()) return;
       readImuTelemetry();
       readBatteryVoltage();
       imuPollTimer = window.setInterval(() => {
-        if (isConnected() && !busy) {
+        if (isConnected() && !busy && !robotIsSleeping()) {
           readImuTelemetry();
           if (Date.now() - lastBatteryReadAt >= 1000) readBatteryVoltage();
         }
@@ -1865,11 +1903,16 @@
       } finally {
         busy = false;
         updateButtons();
-        if (isConnected()) startImuPolling();
+        if (isConnected()) {
+          startImuPolling();
+          if (robotIsSleeping()) setMessage("RickBot is sleeping. Press Wake to restore sensors; motion stays off.");
+        }
       }
     }
 
     function handleDisconnect() {
+      const wasSleeping = robotIsSleeping();
+      sleepSupported = false;
       if (rawInProgress) rawStatus.textContent = "Disconnected during capture. Previous results are kept; repeat this pose after reconnecting.";
       else rawStatus.textContent = "Disconnected. Captured results are kept until the page is reloaded or cleared.";
       ++rawRun;
@@ -1917,11 +1960,33 @@
         showFirmwareStatus("INTERRUPTED", "Reconnect and select firmware.bin to retry.");
         showFirmwareProgress(0, 1, "The inactive slot was not activated.");
         setMessage("Bluetooth disconnected during the update. The current firmware is unchanged.", true);
+      } else if (wasSleeping) {
+        showConnection("Sleeping", "Reconnect, then press Wake", "");
+        setMessage("RickBot is sleeping with servo pulses off. Discovery may take a few seconds.");
+      } else if (currentRobotState === 6) {
+        showConnection("Disconnected", "Servo pulses remain off", "");
+        setMessage("RickBot is awake with its servos released. Reconnect to control it.");
       } else {
         showConnection("Disconnected", "Robot policy stopped automatically", "");
         setMessage("Connection lost. The firmware is holding the robot's last pose.", true);
       }
       updateButtons();
+    }
+
+    function wakeFailureMessage(state, error) {
+      if (state !== 7) {
+        return `Wake was not confirmed; Rick reports ${state === 8 ? "Waking" : state === 5 ? "Sleeping" : "state " + state}. Keep Rick still and retry Wake.`;
+      }
+      const reasons = {
+        1: "the IMU power-down write failed",
+        2: "the I²C bus could not restart",
+        3: "the IMU did not accept its resume sequence",
+        4: "the IMU chip ID could not be verified",
+        5: "the IMU configuration could not be restored or verified",
+        6: "the IMU returned no readable samples after resuming",
+        7: "accelerometer readings did not settle into a usable range; lay Rick still and retry Wake"
+      };
+      return `Wake failed: ${reasons[error] || "this firmware reported a sensor fault without a detailed reason"}. Servo pulses remain off.`;
     }
 
     async function sendCommand(command) {
@@ -1931,7 +1996,14 @@
         "Start PPO motion? Make sure the robot is supported and the area is clear."
       )) return;
 
+      if (command >= 4 && !sleepSupported) return;
+      if (robotIsSleeping() && command !== 5) return;
+      if (command === 4 && !window.confirm(
+        "Sleep and release all servos? Lay Rick down or support it first; it will no longer hold its pose."
+      )) return;
+
       busy = true;
+      stopImuPolling();
       showConnection("Sending…", commandMessages[command], "working");
       setMessage("Sending encrypted command to RickBot…");
       updateButtons();
@@ -1940,20 +2012,39 @@
         const payload = Uint8Array.of(command);
         await writeWithResponse(controlCharacteristic, payload);
 
-        // Firmware receives Bluetooth events in a background context and then
-        // applies commands safely in the main control loop.
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        try {
-          await readRobotState();
-        } catch (error) {
-          showRobotState(command);
+        // Await the actual transition; an acknowledged GATT write only queues it.
+        const deadline = Date.now() + (command === 5 ? 10000 : command === 4 ? 5000 : 1000);
+        let state;
+        do {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          state = await readRobotState();
+          if (command === 4 ? robotIsSleeping() : command === 5 ? state === 6 :
+              state === command || (command === 3 && state === 6)) break;
+        } while (Date.now() < deadline);
+        if (command === 4) {
+          if (!robotIsSleeping()) throw new Error("Sleep was not accepted. Stop any update or capture and retry.");
+          if (state === 7) {
+            setMessage("Servo pulses are off, but IMU shutdown failed. Wake and retry; sleep current may be higher.", true);
+          } else {
+            setMessage(commandMessages[command]);
+            device.gatt.disconnect();
+          }
+        } else if (command === 5) {
+          if (state !== 6) throw new Error(wakeFailureMessage(state, lastWakeError));
+          // Let attitude estimation settle before enabling motion controls.
+          await new Promise((resolve) => setTimeout(resolve, 1100));
+          setMessage(commandMessages[command]);
+        } else if (state === command || (command === 3 && state === 6)) {
+          setMessage(state === 6 ? "Policy stopped; servo pulses remain off." : commandMessages[command]);
+        } else {
+          setMessage("Command was not applied. Check robot state and calibration, then retry.", true);
         }
-        setMessage(commandMessages[command]);
       } catch (error) {
-        setMessage(`${error.message || error.name}. Reconnect and try again.`, true);
+        setMessage(error.message || error.name, true);
         if (!device?.gatt?.connected) handleDisconnect();
       } finally {
         busy = false;
+        if (isConnected()) startImuPolling();
         updateButtons();
       }
     }

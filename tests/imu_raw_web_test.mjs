@@ -95,7 +95,8 @@ console.log("IMU raw web capture, stale-result, and cancellation tests passed");
 // Missing optional services must not disable OTA or prevent a discovery retry.
 let connected = false;
 const supportFake = {
-  isConnected: () => connected, busy: false, commandButtons: [{}],
+  isConnected: () => connected, busy: false, commandButtons: [{ dataset: { command: "0" } }],
+  robotIsSleeping: () => false, sleepSupported: false,
   document: { querySelectorAll: () => [] }, centeredServos: new Set(),
   servoNames: Array(8), bluetoothSupported: true, otaIsAvailable: () => connected,
   otaProtocolVersion: 3, selectedFirmware: {}, otaUpdating: false,

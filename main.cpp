@@ -12,6 +12,8 @@
 
 #include "driver/ledc.h"
 #include "esp_ota_ops.h"
+#include "esp_pm.h"
+#include "esp_bt.h"
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -24,7 +26,12 @@
 #include "imu_axes.h"
 #include "imu_calibration.h"
 #include "imu_raw_capture.h"
+#include "imu_wake.h"
 #include "policy_inference.h"
+
+#if !CONFIG_PM_ENABLE || !CONFIG_FREERTOS_USE_TICKLESS_IDLE || !CONFIG_BT_CTRL_MODEM_SLEEP
+#error "Rick BLE sleep requires the Arduino + ESP-IDF build and sdkconfig.defaults"
+#endif
 
 // Route diagnostics through native USB CDC instead of the exposed UART0 pins.
 #define printf(...) Serial.printf(__VA_ARGS__)
@@ -66,7 +73,7 @@ constexpr uint32_t BATTERY_DIVIDER_RATIO = 3;  // 200 kOhm / 100 kOhm divider.
 constexpr int BATTERY_ADC_SAMPLES = 8;
 
 // MuJoCo actuator order: left roll/upper/lower/foot, then right equivalents.
-constexpr int SERVO_PINS[ACTION_DIM] = {6, 7, 8, 9, 10, 11, 12, 13};
+constexpr int SERVO_PINS[ACTION_DIM] = {10, 11, 12, 13, 6, 7, 8, 9};
 constexpr bool servo_pins_are_valid() {
     for (int first = 0; first < ACTION_DIM; ++first) {
         if (SERVO_PINS[first] == PIN_IMU_SDA ||
@@ -82,9 +89,10 @@ static_assert(servo_pins_are_valid(), "Servo and IMU GPIO assignments overlap");
 constexpr float SERVO_DIRS[ACTION_DIM] = {
     1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
 };
+
 float SERVO_CENTERS_US[ACTION_DIM] = {
-    1645.0f, 1595.0f, 1615.0f, 1550.0f,
-    1350.0f, 1435.0f, 1500.0f, 1480.0f,
+    1340.0f, 1435.0f, 1535.0f, 1475.0f,
+    1715.0f, 1595.0f, 1605.0f, 1560.0f,
 };
 
 constexpr float SERVO_US_PER_RAD = 1000.0f / (PI_F / 2.0f);
@@ -136,6 +144,7 @@ rick::GyroBiasCalibration gyro_calibration(POLICY_GYRO_BIAS_CALIBRATION_SAMPLES)
 
 enum class ControlCommand : uint8_t {
     RESET_DEFAULT = 0, RESET_SERVO_CENTERS = 1, START = 2, STOP = 3,
+    SLEEP = 4, WAKE = 5,
 };
 struct ServoCalibrationCommand { uint8_t servo_index; int16_t delta_us; };
 constexpr uint8_t SERVO_CALIBRATION_FINISH = 0xff;
@@ -145,6 +154,35 @@ constexpr uint8_t CONTROL_STATE_SERVO_CENTERS = 1;
 constexpr uint8_t CONTROL_STATE_RUNNING = 2;
 constexpr uint8_t CONTROL_STATE_STOPPED = 3;
 constexpr uint8_t CONTROL_STATE_CALIBRATING = 4;
+constexpr uint8_t CONTROL_STATE_SLEEPING = 5;
+constexpr uint8_t CONTROL_STATE_RELAXED = 6;
+constexpr uint8_t CONTROL_STATE_SLEEP_FAULT = 7;
+constexpr uint8_t CONTROL_STATE_WAKING = 8;
+volatile rick::ImuWakeError wake_error = rick::ImuWakeError::NONE;
+volatile bool robot_sleeping = false;
+bool servo_outputs_enabled = false;
+uint64_t motion_ready_at = 0;
+uint16_t sleep_battery_mv = 0;
+esp_pm_lock_handle_t awake_cpu_lock = nullptr;
+esp_pm_lock_handle_t awake_sleep_lock = nullptr;
+volatile bool ble_connected = false;
+esp_bd_addr_t ble_peer = {};
+
+void configure_bluetooth_standby(bool sleeping);
+void enter_robot_sleep();
+void wake_robot();
+
+void init_power_management() {
+    esp_pm_config_esp32s3_t config = {};
+    config.max_freq_mhz = 240;
+    config.min_freq_mhz = 40;
+    config.light_sleep_enable = true;
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "rick_cpu", &awake_cpu_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "rick_awake", &awake_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(awake_cpu_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(awake_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_configure(&config));
+}
 
 QueueHandle_t control_command_queue = nullptr;
 QueueHandle_t servo_calibration_command_queue = nullptr;
@@ -361,8 +399,45 @@ bool imu_raw_locks_robot() {
     return imu_raw_capture.active() || imu_raw_capture.restore_failed;
 }
 
+rick::ImuWakeError configure_imu_registers() {
+    uint8_t chip_id = 0;
+    if (!read_imu_register(IMU_REG_CHIP_ID, chip_id) || chip_id != IMU_CHIP_ID) {
+        printf("Tokmas IMU chip ID mismatch: expected 0x%02x, read 0x%02x.\n",
+               IMU_CHIP_ID, chip_id);
+        return rick::ImuWakeError::CHIP_ID;
+    }
+
+    // Enable digital filters. Use 110 Hz with 44 Hz cutoff, +/-4 g, and
+    // +/-2000 dps: the closest Tokmas settings to the old 104 Hz setup.
+    if (!write_imu_register(IMU_REG_ACC_CONFIG_0, 0x01) ||
+        !write_imu_register(IMU_REG_ACC_CONFIG_1,
+                            IMU_ACCEL_RANGE_4G | IMU_ODR_110_HZ) ||
+        !write_imu_register(IMU_REG_ACC_CONFIG_2, 0x00) ||
+        !write_imu_register(IMU_REG_GYRO_CONFIG_1, 0x01) ||
+        !write_imu_register(IMU_REG_GYRO_CONFIG_2,
+                            IMU_GYRO_RANGE_2000_DPS | IMU_ODR_110_HZ) ||
+        !write_imu_register(IMU_REG_GYRO_CONFIG_3, 0x00)) {
+        return rick::ImuWakeError::CONFIG;
+    }
+    delay(20);
+
+    uint8_t accel_config = 0, gyro_config = 0;
+    const bool configured =
+        read_imu_register(IMU_REG_ACC_CONFIG_1, accel_config) &&
+        read_imu_register(IMU_REG_GYRO_CONFIG_2, gyro_config) &&
+        accel_config == (IMU_ACCEL_RANGE_4G | IMU_ODR_110_HZ) &&
+        gyro_config == (IMU_GYRO_RANGE_2000_DPS | IMU_ODR_110_HZ);
+    if (configured) {
+        printf("Tokmas ICM-42688-P ready at I2C address 0x36.\n");
+    } else {
+        printf("Tokmas configuration readback failed: accel=0x%02x gyro=0x%02x.\n",
+               accel_config, gyro_config);
+    }
+    return configured ? rick::ImuWakeError::NONE : rick::ImuWakeError::CONFIG;
+}
+
 bool init_imu() {
-    Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL, 400000);
+    if (!Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL, 400000)) return false;
     Wire.setTimeOut(10);
     pinMode(PIN_IMU_INT1, INPUT);
     // Tokmas specifies up to 320 ms from power-on before register access.
@@ -379,40 +454,7 @@ bool init_imu() {
         return false;
     }
 
-    uint8_t chip_id = 0;
-    if (!read_imu_register(IMU_REG_CHIP_ID, chip_id) || chip_id != IMU_CHIP_ID) {
-        printf("Tokmas IMU chip ID mismatch: expected 0x%02x, read 0x%02x.\n",
-               IMU_CHIP_ID, chip_id);
-        return false;
-    }
-
-    // Enable digital filters. Use 110 Hz with 44 Hz cutoff, +/-4 g, and
-    // +/-2000 dps: the closest Tokmas settings to the old 104 Hz setup.
-    if (!write_imu_register(IMU_REG_ACC_CONFIG_0, 0x01) ||
-        !write_imu_register(IMU_REG_ACC_CONFIG_1,
-                            IMU_ACCEL_RANGE_4G | IMU_ODR_110_HZ) ||
-        !write_imu_register(IMU_REG_ACC_CONFIG_2, 0x00) ||
-        !write_imu_register(IMU_REG_GYRO_CONFIG_1, 0x01) ||
-        !write_imu_register(IMU_REG_GYRO_CONFIG_2,
-                            IMU_GYRO_RANGE_2000_DPS | IMU_ODR_110_HZ) ||
-        !write_imu_register(IMU_REG_GYRO_CONFIG_3, 0x00)) {
-        return false;
-    }
-    delay(20);
-
-    uint8_t accel_config = 0, gyro_config = 0;
-    const bool configured =
-        read_imu_register(IMU_REG_ACC_CONFIG_1, accel_config) &&
-        read_imu_register(IMU_REG_GYRO_CONFIG_2, gyro_config) &&
-        accel_config == (IMU_ACCEL_RANGE_4G | IMU_ODR_110_HZ) &&
-        gyro_config == (IMU_GYRO_RANGE_2000_DPS | IMU_ODR_110_HZ);
-    if (configured) {
-        printf("Tokmas ICM-42688-P ready at I2C address 0x36.\n");
-    } else {
-        printf("Tokmas configuration readback failed: accel=0x%02x gyro=0x%02x.\n",
-               accel_config, gyro_config);
-    }
-    return configured;
+    return configure_imu_registers() == rick::ImuWakeError::NONE;
 }
 
 int16_t clamp_to_int16(float value) {
@@ -448,6 +490,23 @@ bool read_imu(float *gx, float *gy, float *gz, float *ax, float *ay, float *az) 
     return true;
 }
 
+struct ImuWakeIO {
+    bool begin() {
+        // Recreate the driver/clock configuration after automatic light sleep.
+        Wire.end();
+        const bool ready = Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL, 400000);
+        Wire.setTimeOut(10);
+        return ready;
+    }
+    bool write(uint8_t reg, uint8_t value) { return write_imu_register(reg, value); }
+    rick::ImuWakeError configure() { return configure_imu_registers(); }
+    bool read_accel(float &ax, float &ay, float &az) {
+        float gx, gy, gz;
+        return read_imu(&gx, &gy, &gz, &ax, &ay, &az);
+    }
+    void wait_ms(unsigned ms) { delay(ms); }
+} imu_wake_io;
+
 float servo_pulse_width_us(int index, float action, bool use_default_pose=true) {
     const float target = (use_default_pose ? POLICY_DEFAULT_POSE_RAD[index] : 0) +
                          action * POLICY_ACTION_SCALE_RAD;
@@ -471,6 +530,10 @@ void init_servos() {
     }
 }
 void update_servos(const float *actions, bool use_default_pose=true) {
+    if (!servo_outputs_enabled) {
+        ESP_ERROR_CHECK(ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0));
+        servo_outputs_enabled = true;
+    }
     for (int i=0;i<ACTION_DIM;++i) {
         const auto channel=static_cast<ledc_channel_t>(i);
         ledc_set_duty(LEDC_LOW_SPEED_MODE, channel,
@@ -515,6 +578,12 @@ void apply_servo_calibration_command(const ServoCalibrationCommand &command) {
            command.delta_us,SERVO_CENTERS_US[command.servo_index]);
 }
 void apply_control_command(ControlCommand command) {
+    if (robot_sleeping) {
+        if (command == ControlCommand::WAKE) wake_robot();
+        return;
+    }
+    if (command == ControlCommand::WAKE) return;
+    if (command == ControlCommand::SLEEP) { enter_robot_sleep(); return; }
     if (command == ControlCommand::STOP) cancel_imu_raw();
     else if (imu_raw_locks_robot()) return;
     servo_calibration_active=false;
@@ -525,6 +594,7 @@ void apply_control_command(ControlCommand command) {
         control_state=CONTROL_STATE_SERVO_CENTERS;
         printf("Bluetooth command: reset every servo to its raw calibrated center.\n");break;
     case ControlCommand::START:
+        if (time_us_64() < motion_ready_at) return;
         if(POLICY_GYRO_BIAS_CALIBRATION&&!gyro_calibration.ready()){
             printf("Hold Rick still for gyro calibration before Start (%.1f seconds).\n",
                    POLICY_GYRO_BIAS_CALIBRATION_SAMPLES*POLICY_CONTROL_DT);break;}
@@ -533,11 +603,93 @@ void apply_control_command(ControlCommand command) {
             current_obs[h*ACTION_DIM+a]=target_actions[a];
         robot_running=true;control_state=CONTROL_STATE_RUNNING;printf("Bluetooth command: start policy.\n");break;
     case ControlCommand::STOP: robot_running=false;control_schedule.reset(time_us_64());
-        control_state=CONTROL_STATE_STOPPED;printf("Bluetooth command: stop policy and hold current pose.\n");break;
+        control_state=servo_outputs_enabled ? CONTROL_STATE_STOPPED : CONTROL_STATE_RELAXED;
+        printf("Bluetooth command: stop policy.\n");break;
+    case ControlCommand::SLEEP: case ControlCommand::WAKE: break;
     }
 }
 
 template<typename T> void drain_queue(QueueHandle_t queue){T item;while(xQueueReceive(queue,&item,0)==pdTRUE){}}
+// Tokmas datasheet figure 8; this register has no documented readback contract.
+bool power_down_imu() { return write_imu_register(0x30, 0x07); }
+
+void enter_robot_sleep() {
+    robot_running = false;
+    servo_calibration_active = false;
+    cancel_imu_raw();
+    // Drive every signal LOW, not floating, while the servo supply remains on.
+    for (int i = 0; i < ACTION_DIM; ++i)
+        ESP_ERROR_CHECK(ledc_stop(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(i), 0));
+    ESP_ERROR_CHECK(ledc_timer_pause(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0));
+    servo_outputs_enabled = false;
+    control_state = CONTROL_STATE_RELAXED;
+    // Close the callback gate before discarding commands that raced with Sleep.
+    robot_sleeping = true;
+    drain_queue<uint8_t>(control_command_queue);
+    drain_queue<ServoCalibrationCommand>(servo_calibration_command_queue);
+    drain_queue<ImuRawCommand>(imu_raw_command_queue);
+    drain_queue<OtaControlPacket>(ota_control_queue);
+    drain_queue<OtaDataPacket>(ota_data_queue);
+    stop_requested = false;
+    uint8_t sleep_state = CONTROL_STATE_SLEEPING;
+    wake_error = rick::ImuWakeError::NONE;
+    if (!power_down_imu()) {
+        wake_error = rick::ImuWakeError::POWER_DOWN;
+        // Keep motion inhibited if a partial I2C transaction left the IMU asleep.
+        sleep_state = CONTROL_STATE_SLEEP_FAULT;
+        printf("IMU power-down failed; asleep with servo outputs disabled. Wake to retry initialization.\n");
+    }
+    sleep_battery_mv = read_battery_voltage_mv();
+    std::fill(std::begin(imu_telemetry), std::end(imu_telemetry), 0);
+    neopixelWrite(PIN_STATUS_LED, 0, 0, 0);
+    configure_bluetooth_standby(true);
+    printf("Sleeping: servo PWM off; encrypted Wake required.\n");
+    // USB is deliberately unavailable in standby; BOOT + reset still recovers it.
+    Serial.end();
+    control_state = sleep_state;
+    ESP_ERROR_CHECK(esp_pm_lock_release(awake_cpu_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_release(awake_sleep_lock));
+}
+
+void wake_robot() {
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(awake_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(awake_cpu_lock));
+    Serial.begin(115200);
+    control_state = CONTROL_STATE_WAKING;
+    wake_error = rick::ImuWakeError::NONE;
+    // A dedicated resume restores the bus, follows the vendor sequence, verifies
+    // configuration, and waits for usable samples without issuing a cold reset.
+    // Servo pulses remain disabled throughout, including on every failure path.
+    float attitude[4];
+    wake_error = rick::resume_imu(imu_wake_io, attitude);
+    if (wake_error != rick::ImuWakeError::NONE) {
+        printf("Wake failed at step %u; remaining asleep with PWM off.\n", unsigned(wake_error));
+        power_down_imu();
+        Serial.end();
+        control_state = CONTROL_STATE_SLEEP_FAULT;
+        ESP_ERROR_CHECK(esp_pm_lock_release(awake_cpu_lock));
+        ESP_ERROR_CHECK(esp_pm_lock_release(awake_sleep_lock));
+        return;
+    }
+    imu_raw_capture = rick::ImuRawCapture{};
+    publish_imu_raw();
+    imu_clock.reset();
+    gyro_calibration.reset_window();
+    imu_consecutive_read_errors = 0;
+    q0 = attitude[0]; q1 = attitude[1]; q2 = attitude[2]; q3 = attitude[3];
+    std::fill(std::begin(target_actions), std::end(target_actions), 0.0f);
+    reset_policy_history_and_clock(0);
+    motion_ready_at = time_us_64() + 1000000;
+    stop_requested = false;
+    // Discard motion commands received during the wake transition.
+    drain_queue<uint8_t>(control_command_queue);
+    configure_bluetooth_standby(false);
+    control_state = CONTROL_STATE_RELAXED;
+    robot_sleeping = false;
+    neopixelWrite(PIN_STATUS_LED, 16, 16, 16);
+    printf("Awake; PWM remains off until a pose or Start command.\n");
+}
+
 void process_control_commands(){
     if(stop_requested){stop_requested=false;drain_queue<uint8_t>(control_command_queue);
         drain_queue<ImuRawCommand>(imu_raw_command_queue);
@@ -546,10 +698,11 @@ void process_control_commands(){
     uint8_t value;while(xQueueReceive(control_command_queue,&value,0)==pdTRUE)
         apply_control_command(static_cast<ControlCommand>(value));
 }
-void process_servo_calibration_commands(){ServoCalibrationCommand command;
+void process_servo_calibration_commands(){if(robot_sleeping)return;ServoCalibrationCommand command;
     while(xQueueReceive(servo_calibration_command_queue,&command,0)==pdTRUE)
         apply_servo_calibration_command(command);}
 void process_imu_raw_commands() {
+    if (robot_sleeping) return;
     ImuRawCommand command;
     while (xQueueReceive(imu_raw_command_queue, &command, 0) == pdTRUE) {
         if (command.pose == 0) {
@@ -671,12 +824,12 @@ class RickCharacteristicCallbacks:public BLECharacteristicCallbacks{
 public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY,IMU_RAW};
     explicit RickCharacteristicCallbacks(Kind kind):kind_(kind){}
     void onRead(BLECharacteristic *c)override{
-        if(kind_==Kind::CONTROL){const uint8_t state=control_state;set_value(c,&state,1);}
+        if(kind_==Kind::CONTROL){const uint8_t state[3]={control_state,1,uint8_t(wake_error)};set_value(c,state,sizeof(state));}
         else if(kind_==Kind::IMU_RAW){uint8_t b[rick::ImuRawCapture::PACKET_SIZE];
             portENTER_CRITICAL(&imu_raw_mutex);std::memcpy(b,imu_raw_packet,sizeof(b));portEXIT_CRITICAL(&imu_raw_mutex);
             set_value(c,b,sizeof(b));}
         else if(kind_==Kind::IMU){uint8_t b[12];for(int i=0;i<6;++i){const uint16_t v=imu_telemetry[i];b[2*i]=v;b[2*i+1]=v>>8;}set_value(c,b,sizeof(b));}
-        else if(kind_==Kind::BATTERY){const uint16_t v=read_battery_voltage_mv();const uint8_t b[2]={uint8_t(v),uint8_t(v>>8)};set_value(c,b,sizeof(b));}
+        else if(kind_==Kind::BATTERY){const uint16_t v=robot_sleeping ? sleep_battery_mv : read_battery_voltage_mv();const uint8_t b[2]={uint8_t(v),uint8_t(v>>8)};set_value(c,b,sizeof(b));}
         else if(kind_==Kind::SERVO){uint8_t b[ACTION_DIM*2];for(int i=0;i<ACTION_DIM;++i){const uint16_t v=std::lround(SERVO_CENTERS_US[i]);b[2*i]=v;b[2*i+1]=v>>8;}set_value(c,b,sizeof(b));}
         else if(kind_==Kind::OTA_STATUS){uint8_t b[32]={OTA_PROTOCOL_VERSION,uint8_t(ota_state),uint8_t(ota_error),ota_target_partition};
             write_u32(&b[4],ota_bytes_received);write_u32(&b[8],ota_total_bytes);write_u32(&b[12],ota_chunks_received);
@@ -684,10 +837,12 @@ public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY
                 uint8_t(running->subtype-ESP_PARTITION_SUBTYPE_APP_OTA_MIN):0xff;b[19]=1;write_u32(&b[28],ESP32_S3_FAMILY_ID);set_value(c,b,sizeof(b));}}
     void onWrite(BLECharacteristic *c)override{const std::string value=c->getValue();
         const auto *data=reinterpret_cast<const uint8_t*>(value.data());const size_t size=value.size();
+        if(control_state==CONTROL_STATE_WAKING)return;
+        if(robot_sleeping && (kind_!=Kind::CONTROL || size!=1 || data[0]!=uint8_t(ControlCommand::WAKE)))return;
         if(kind_==Kind::IMU_RAW){if(ota_locks_robot()||size!=4||data[0]!=1||data[3]>6)return;
             const ImuRawCommand command={uint16_t(uint16_t(data[1])|(uint16_t(data[2])<<8)),data[3]};
             xQueueSend(imu_raw_command_queue,&command,0);return;}
-        if(kind_==Kind::CONTROL){if(ota_locks_robot()||size!=1||data[0]>uint8_t(ControlCommand::STOP))return;
+        if(kind_==Kind::CONTROL){if(ota_locks_robot()||size!=1||data[0]>uint8_t(ControlCommand::WAKE))return;
             if(data[0]==uint8_t(ControlCommand::STOP))stop_requested=true;else xQueueSend(control_command_queue,data,0);}
         else if(kind_==Kind::SERVO){if(ota_locks_robot()||size!=3)return;const int16_t delta=int16_t(uint16_t(data[1])|(uint16_t(data[2])<<8));
             const bool finish=data[0]==SERVO_CALIBRATION_FINISH;if((finish&&delta)||( !finish&&(data[0]>=ACTION_DIM||!delta||delta< -SERVO_CALIBRATION_MAX_STEP_US||delta>SERVO_CALIBRATION_MAX_STEP_US)))return;
@@ -699,12 +854,46 @@ public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY
         else if(kind_==Kind::OTA_DATA){if(size<=4||size>OTA_MAX_DATA_VALUE_SIZE||ota_state!=OtaState::RECEIVING)return;
             OtaDataPacket packet={};packet.length=size;std::memcpy(packet.bytes,data,size);xQueueSend(ota_data_queue,&packet,0);}}
 private:Kind kind_;};
-class RickServerCallbacks:public BLEServerCallbacks{void onConnect(BLEServer*)override{printf("Bluetooth connected.\n");}
-    void onDisconnect(BLEServer*)override{stop_requested=true;ota_abort_requested=true;printf("Bluetooth disconnected; stopping policy.\n");BLEDevice::startAdvertising();}};
+void request_connection_interval(bool sleeping) {
+    if (!ble_connected) return;
+    esp_ble_conn_update_params_t params = {};
+    std::memcpy(params.bda, ble_peer, sizeof(params.bda));
+    // Units: 1.25 ms intervals, 10 ms timeout. The phone may negotiate these.
+    params.min_int = sleeping ? 160 : 12;
+    params.max_int = sleeping ? 320 : 24;
+    params.latency = sleeping ? 4 : 0;
+    params.timeout = 600;
+    esp_ble_gap_update_conn_params(&params);
+}
+void configure_bluetooth_standby(bool sleeping) {
+    auto *advertising = BLEDevice::getAdvertising();
+    if (!ble_connected) advertising->stop();
+    // Advertising units are 0.625 ms: standby 1–2 seconds, awake 20–40 ms.
+    advertising->setMinInterval(sleeping ? 1600 : 32);
+    advertising->setMaxInterval(sleeping ? 3200 : 64);
+    advertising->setMinPreferred(sleeping ? 160 : 12);
+    advertising->setMaxPreferred(sleeping ? 320 : 24);
+    if (!ble_connected) advertising->start();
+    request_connection_interval(sleeping);
+}
+class RickServerCallbacks:public BLEServerCallbacks {
+    void onConnect(BLEServer*, esp_ble_gatts_cb_param_t *param) override {
+        std::memcpy(ble_peer, param->connect.remote_bda, sizeof(ble_peer));
+        ble_connected = true;
+        request_connection_interval(robot_sleeping);
+    }
+    void onDisconnect(BLEServer*) override {
+        ble_connected = false;
+        if (!robot_sleeping) stop_requested = true;
+        ota_abort_requested = true;
+        BLEDevice::startAdvertising();
+    }
+};
 BLECharacteristic *create_characteristic(BLEService *service,const char *uuid,uint32_t properties,
     esp_gatt_perm_t permissions,RickCharacteristicCallbacks::Kind kind){auto *c=service->createCharacteristic(uuid,properties);
     c->setAccessPermissions(permissions);c->setCallbacks(new RickCharacteristicCallbacks(kind));return c;}
 bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *server=BLEDevice::createServer();
+    ESP_ERROR_CHECK(esp_bt_sleep_enable());
     server->setCallbacks(new RickServerCallbacks());auto *service=server->createService(BLEUUID(SERVICE_UUID),32);
     create_characteristic(service,CONTROL_UUID,BLECharacteristic::PROPERTY_READ|BLECharacteristic::PROPERTY_WRITE,
         esp_gatt_perm_t(ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE_ENCRYPTED),RickCharacteristicCallbacks::Kind::CONTROL);
@@ -730,6 +919,7 @@ bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *se
 void setup(){neopixelWrite(PIN_STATUS_LED, 16, 16, 16);Serial.begin(115200);delay(250);printf("\nStarting Rick ESP32-S3 policy checkpoint %u (%d obs, %d actions)...\n",
     unsigned(POLICY_CHECKPOINT_STEP),OBS_DIM,ACTION_DIM);printf("Controller: ESP32-S3 LX7 at %u MHz, target period=%lu us.\n",
     getCpuFrequencyMhz(),static_cast<unsigned long>(CONTROL_PERIOD_US));
+    init_power_management();
     init_battery_monitor();
     control_command_queue=xQueueCreate(8,sizeof(uint8_t));servo_calibration_command_queue=xQueueCreate(8,sizeof(ServoCalibrationCommand));
     imu_raw_command_queue=xQueueCreate(4,sizeof(ImuRawCommand));
@@ -739,8 +929,17 @@ void setup(){neopixelWrite(PIN_STATUS_LED, 16, 16, 16);Serial.begin(115200);dela
         while(true)delay(1000);}
     init_servos();reset_servos(0);control_state=CONTROL_STATE_DEFAULT;
     printf("Servos at calibrated default pose; policy is stopped.\n");init_bluetooth();control_schedule.reset(time_us_64());}
-void loop(){process_ota_abort_request();process_ota_control_packets();process_ota_data_packets();
+void loop(){
+    if (robot_sleeping) {
+        uint8_t command;
+        // Block indefinitely: BLE/RTOS schedules radio events; no busy polling.
+        if (xQueueReceive(control_command_queue, &command, portMAX_DELAY) == pdTRUE)
+            apply_control_command(static_cast<ControlCommand>(command));
+        return;
+    }
+    process_ota_abort_request();process_ota_control_packets();process_ota_data_packets();
     if(!ota_locks_robot()){process_control_commands();process_imu_raw_commands();process_servo_calibration_commands();}
+    if(robot_sleeping)return;
     if(imu_raw_locks_robot()){
         imu_raw_capture.tick(imu_raw_io,time_us_64());publish_imu_raw();
         control_schedule.reset(time_us_64());imu_clock.reset();delay(1);return;}

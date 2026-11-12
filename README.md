@@ -7,20 +7,25 @@ dual-slot BLE firmware updates.
 
 The target is the standard ESP32-S3-Zero with 4 MB flash and 2 MB QSPI PSRAM.
 PlatformIO uses Waveshare's recommended `esp32-s3-devkitm-1` board profile with
-the flash, PSRAM, USB CDC, and partition layout overridden in `platformio.ini`.
+the flash, PSRAM, USB CDC, and partition layout overridden in `platformio.ini`
+and `sdkconfig.defaults`. Arduino 2.0.17 is compiled as an ESP-IDF 4.4.7 component
+so Bluetooth modem sleep, power management, and tickless idle are enabled in
+the SDK. The precompiled Arduino-only SDK cannot provide this mode.
+`firmware/main.cpp` includes the existing root `main.cpp`; the two CMake files
+provide the ESP-IDF build entry points.
 
 ## Wiring
 
 | Device | Connector/signal | GPIO |
 |---|---|---:|
-| Left roll servo | J4 / PWM | 6 |
-| Left upper servo | J5 / PWM | 7 |
-| Left lower servo | J6 / PWM | 8 |
-| Left foot servo | J7 / PWM | 9 |
-| Right roll servo | J8 / PWM | 10 |
-| Right upper servo | J9 / PWM | 11 |
-| Right lower servo | J10 / PWM | 12 |
-| Right foot servo | J11 / PWM | 13 |
+| Right roll servo | J4 / PWM | 6 |
+| Right upper servo | J5 / PWM | 7 |
+| Right lower servo | J6 / PWM | 8 |
+| Right foot servo | J7 / PWM | 9 |
+| Left roll servo | J8 / PWM | 10 |
+| Left upper servo | J9 / PWM | 11 |
+| Left lower servo | J10 / PWM | 12 |
+| Left foot servo | J11 / PWM | 13 |
 | Tokmas ICM-42688-P | SDA | 2 |
 | Tokmas ICM-42688-P | SCL | 4 |
 | Tokmas ICM-42688-P | INT1 | 5 |
@@ -86,7 +91,7 @@ application. Later wired uploads can normally use the same command without
 holding BOOT; if native USB is unavailable, enter download mode again.
 
 The custom 4 MB partition table provides two 1.94 MB application slots. The
-current build is about 1.20 MB. PlatformIO fails the build if the image grows
+application is approximately 1.2 MB. PlatformIO fails the build if the image grows
 beyond one slot.
 
 ## Policy and control loop
@@ -133,9 +138,80 @@ The controller provides:
 - live servo-center calibration;
 - encrypted wireless firmware updates.
 
-Disconnecting Bluetooth stops the policy and holds the last servo command.
+Disconnecting Bluetooth stops the policy and holds the last servo command
+when PWM is enabled. Sleeping or released servos stay released.
 Servo-center changes are kept only in RAM; copy the generated
 `SERVO_CENTERS_US` declaration into `main.cpp` and rebuild to preserve them.
+
+## Bluetooth standby
+
+With Rick laid down or supported, press **Sleep**. The firmware stops policy
+inference, cancels raw capture, drives all eight servo signals low, pauses their
+PWM timer, powers down the Tokmas IMU, turns off the RGB LED, and ends USB serial.
+The web controller waits for confirmation, stops telemetry polling, and
+disconnects. The servo supply remains on with this PCB; motor release and total
+battery current must be checked with your actual servos.
+
+RickBot then advertises connectably every 1–2 seconds. The control task blocks
+on its command queue while BLE modem sleep and automatic light sleep handle
+radio activity. Discovery may take several seconds. Reconnect and press
+**Wake** to send the encrypted command over the existing bonded connection.
+Connecting, disconnecting, Stop, calibration, OTA, and ordinary motion commands
+cannot wake it. A client that stays connected is offered longer connection
+intervals and peripheral latency; the phone decides whether to accept them.
+For the lowest consumption, disconnect while asleep as the web controller does.
+
+Wake restores USB serial, restarts the I2C driver, and uses the Tokmas resume
+sequence without repeating the cold-start reset. It verifies the chip ID and
+configuration, waits for three consecutive usable accelerometer samples (up to
+two seconds of sample polling), resets tilt from their average, then restores
+the LED and attitude estimation. Hold Rick
+still during wake. **Servo pulses remain off** until an explicit pose,
+calibration, or Start command. Motion Start is inhibited for one second after
+wake. An IMU failure leaves the robot asleep with outputs off and a sensor-fault
+state; retry Wake after checking the sensor. An IMU power-down failure also
+reports a fault and may consume more power than normal standby.
+
+Sleep is a RAM state, not a persistent boot preference: reset or power cycling
+still performs the existing default-pose startup. USB serial is unavailable
+while asleep; wake over BLE or use BOOT plus reset for wired recovery. Measure
+standby current at the battery with USB unplugged, after the BLE client has
+disconnected. Sleep current and battery lifetime have not been measured.
+
+The control characteristic remains compatible with older clients: its first
+read byte is the state; a new second byte is a capability bitmask (bit 0 means
+Sleep/Wake support). Commands 0–3 retain their meanings; **4 = Sleep**, **5 =
+Wake**. New states are **5 = Sleeping**, **6 = Awake with PWM off**, and **7 =
+Sleeping with sensor fault**, and **8 = Waking**. A third read byte reports the
+last sleep/wake error: 0 = none, 1 = power-down write, 2 = I2C restart, 3 = resume
+sequence, 4 = chip ID, 5 = configuration, 6 = no readable samples, 7 = unusable
+accelerometer samples. The page accepts old one/two-byte responses and displays
+the detailed reason when provided. A timeout is shown separately from a reported
+sensor fault. All writes retain encrypted GATT permissions.
+The new UI disables Sleep/Wake when talking to older firmware. IMU readings are
+zeroed during sleep; battery reads return the last value sampled on sleep entry.
+Wake before starting an OTA update. If the installed firmware cannot wake,
+support Rick and power-cycle it to return to normal startup, then update over
+Bluetooth before sleeping again. Reset re-enables the default servo pose.
+
+On a fresh checkout, `pio run` downloads ESP-IDF and builds its libraries once.
+If changing SDK options later, remove the generated `sdkconfig.<environment>`
+file before rebuilding so `sdkconfig.defaults` is reapplied. Generated SDK
+configurations are ignored by Git. Do not substitute `-DCONFIG_PM_ENABLE` for
+rebuilding the SDK; defining the macro alone does not enable power management.
+
+Hardware acceptance checks (support the robot throughout):
+
+1. Verify normal boot, IMU readings, motion control, calibration, and OTA.
+2. Sleep and verify the LED goes dark, USB disconnects, and all servo signals
+   stay low. Confirm the servos release instead of holding torque.
+3. Reconnect after at least a minute; verify it still reports Sleeping, then
+   disconnect again. Repeat after leaving it asleep overnight.
+4. Wake and verify live IMU readings return while servo pulses remain off;
+   choose a pose explicitly before testing Start and Stop.
+5. Repeat several sleep/wake cycles, including waking from a different resting
+   orientation. Test failed sensor communication with servo power disconnected.
+6. Measure battery current both asleep/disconnected and asleep/connected.
 
 ## Wireless firmware updates
 
@@ -169,6 +245,11 @@ c++ -std=c++17 -O2 -I. tests/control_test.cpp -o /tmp/rick-control-test
 /tmp/rick-control-test
 python -m unittest tests/export_policy_test.py
 node tests/uf2_test.mjs .pio/build/waveshare_esp32_s3_zero/firmware.bin
+node tests/sleep_web_test.mjs
+c++ -std=c++17 -O2 -I. tests/sleep_attitude_test.cpp -o /tmp/rick-sleep-attitude-test
+/tmp/rick-sleep-attitude-test
+c++ -std=c++17 -O2 -I. tests/imu_wake_test.cpp -o /tmp/rick-imu-wake-test
+/tmp/rick-imu-wake-test
 ```
 
 On hardware, verify in this order with the robot supported:

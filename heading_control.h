@@ -7,7 +7,21 @@
 
 namespace rick {
 
-// Matches Joystick._heading_from_quat: IMU -Y is forward after axis mapping.
+// Reinitialize tilt after the robot may have been moved with its IMU asleep.
+// Accelerometer is in policy axes and g. Yaw is unobservable, so start at zero.
+inline bool attitude_from_accel(float ax, float ay, float az, float *q) {
+    const float norm2 = ax * ax + ay * ay + az * az;
+    if (!std::isfinite(norm2) || norm2 < 0.25f || norm2 > 2.25f) return false;
+    const float roll = std::atan2(ay, az);
+    const float pitch = std::atan2(-ax, std::sqrt(ay * ay + az * az));
+    const float cr = std::cos(roll / 2), sr = std::sin(roll / 2);
+    const float cp = std::cos(pitch / 2), sp = std::sin(pitch / 2);
+    q[0] = cr * cp; q[1] = sr * cp;
+    q[2] = cr * sp; q[3] = -sr * sp;
+    return true;
+}
+
+// Matches Joystick._heading_from_quat: policy-frame -Y is forward.
 inline float heading_from_quat(float w, float x, float y, float z) {
     return std::atan2(2.0f * (w * z - x * y),
                       1.0f - 2.0f * (x * x + z * z));

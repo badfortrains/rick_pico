@@ -3,6 +3,8 @@ build_bootstrap
 build_sdk23
 build_riscv
 .pio/
+sdkconfig.*
+!sdkconfig.defaults
 __pycache__/
 *.pyc
 .vscode/*
