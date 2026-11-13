@@ -33,6 +33,26 @@ on the updated page.
 
 Raw diagnostic captures remain uncorrected so they can detect later changes.
 
+## Chassis mounting correction (2026-11-12)
+
+A separate upright capture with the chassis confirmed level gave these sensor
+means (50 samples per range, none clipped):
+
+| Range | Sensor X | Sensor Y | Sensor Z |
+| --- | --- | --- | --- |
+| +/-2 g | -23378.9 | -13583.7 | -13600.6 |
+| +/-4 g | -11691.3 | -6792.2 | -6800.7 |
+| +/-8 g | -5844.9 | -3397.0 | -3402.6 |
+
+With the existing sensor calibration, the +/-4 g row gives policy acceleration
+`[-0.074274, +0.014876, +1.056206]` g, corresponding to roll +0.807 degrees
+and pitch +4.022 degrees. `imu_mounting.h` uses the shortest rotation aligning
+this gravity direction with level, applied to both acceleration and gyro after
+nominal axis mapping. The other two ranges agree within 0.07 degrees. This
+does not measure yaw alignment. Magnitude remains about 1.059 g; a single
+orientation cannot determine a replacement offset/sensitivity calibration.
+The raw-test CSV remains uncorrected; use its sensor columns for calculations.
+
 ## Bluetooth and web page (no USB needed)
 
 The normal `waveshare_esp32_s3_zero` firmware now includes the raw-count test

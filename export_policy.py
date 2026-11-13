@@ -209,11 +209,28 @@ def _validate_configuration(
 
     history_length = int(env_config["command_history_length"])
     heading = bool(env_config.get("heading_observation", False))
-    expected_obs_dim = history_length * action_dim + 9 + 2 * heading
+    motion_version = env_config.get("motion_command_version", 0)
+    if motion_version not in (0, 1):
+        raise ValueError("Unsupported motion_command_version")
+    if motion_version:
+        if not heading:
+            raise ValueError("Motion command policies require heading observations")
+        for name in ("forward_velocity_range", "yaw_rate_range"):
+            bounds = env_config[name]
+            if (len(bounds) != 2 or not all(math.isfinite(x) for x in bounds)
+                    or not bounds[0] <= 0 <= bounds[1]
+                    or any(abs(x * 1000) > 32767 or abs(x * 1000 - round(x * 1000)) > 1e-5 for x in bounds)):
+                raise ValueError(f"{name} must include zero and fit signed integer Bluetooth units")
+        for name in ("linear_acceleration_limit", "yaw_acceleration_limit"):
+            if not math.isfinite(env_config[name]) or env_config[name] <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        if not env_config['forward_velocity_range'][0] <= env_config['target_velocity'] <= env_config['forward_velocity_range'][1]:
+            raise ValueError("target_velocity must be within forward_velocity_range")
+    expected_obs_dim = history_length * action_dim + 9 + motion_version + 2 * heading
     if obs_dim != expected_obs_dim:
         raise ValueError(
             "Rick deployment observation mismatch: expected "
-            f"{history_length} * {action_dim} + 9 + {2 * heading} = {expected_obs_dim}, got {obs_dim}"
+            f"{history_length} * {action_dim} + 9 + {motion_version} + {2 * heading} = {expected_obs_dim}, got {obs_dim}"
         )
     samples = env_config.get("gyro_bias_calibration_samples", 100)
     if not isinstance(samples, int) or isinstance(samples, bool) or samples < 1:
@@ -332,6 +349,7 @@ def _build_header(
         f"#define POLICY_MAX_LAYER_DIM {max_layer_dim}",
         f"#define POLICY_COMMAND_HISTORY_LENGTH {int(env_config['command_history_length'])}",
         f"#define POLICY_CHECKPOINT_STEP {checkpoint_step}",
+        f"#define POLICY_MOTION_COMMAND_VERSION {int(env_config.get('motion_command_version', 0))}",
         f"#define POLICY_HEADING_OBSERVATION {int(bool(env_config.get('heading_observation', False)))}",
         f"#define POLICY_GYRO_BIAS_CALIBRATION {int(bool(env_config.get('gyro_bias_calibration', False)))}",
         f"#define POLICY_GYRO_BIAS_CALIBRATION_SAMPLES {int(env_config.get('gyro_bias_calibration_samples', 100))}",
@@ -339,6 +357,12 @@ def _build_header(
         f"static const float POLICY_CONTROL_DT = {_float_literal(env_config['ctrl_dt'])};",
         f"static const float POLICY_STEP_FREQUENCY = {_float_literal(env_config['step_frequency'])};",
         f"static const float POLICY_GYRO_OBS_SCALE = {_float_literal(env_config['gyro_obs_scale'])};",
+        f"static const float POLICY_FORWARD_MIN = {_float_literal(env_config.get('forward_velocity_range', [env_config['target_velocity']] * 2)[0])};",
+        f"static const float POLICY_FORWARD_MAX = {_float_literal(env_config.get('forward_velocity_range', [env_config['target_velocity']] * 2)[1])};",
+        f"static const float POLICY_YAW_MIN = {_float_literal(env_config.get('yaw_rate_range', [0, 0])[0])};",
+        f"static const float POLICY_YAW_MAX = {_float_literal(env_config.get('yaw_rate_range', [0, 0])[1])};",
+        f"static const float POLICY_LINEAR_ACCELERATION = {_float_literal(env_config.get('linear_acceleration_limit', 0.05))};",
+        f"static const float POLICY_YAW_ACCELERATION = {_float_literal(env_config.get('yaw_acceleration_limit', 1.0))};",
         f"static const float POLICY_TARGET_VELOCITY = {_float_literal(env_config['target_velocity'])};",
         f"static const float POLICY_ACTION_SCALE_RAD = {_float_literal(env_config['action_scale'])};",
         "",

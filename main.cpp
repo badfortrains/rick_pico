@@ -22,9 +22,12 @@
 #include "mbedtls/sha256.h"
 
 #include "control_timing.h"
+#include "gait_diagnostics.h"
 #include "heading_control.h"
 #include "imu_axes.h"
 #include "imu_calibration.h"
+#include "imu_mounting.h"
+#include "motion_control.h"
 #include "imu_raw_capture.h"
 #include "imu_wake.h"
 #include "policy_inference.h"
@@ -50,13 +53,26 @@
 #define POLICY_GYRO_BIAS_CALIBRATION_SAMPLES 100
 #endif
 
+// Old exported weights remain usable at their single trained speed. They
+// advertise no motion capability; exporting a new command policy enables it.
+#ifndef POLICY_MOTION_COMMAND_VERSION
+#define POLICY_MOTION_COMMAND_VERSION 0
+const float POLICY_FORWARD_MIN = POLICY_TARGET_VELOCITY;
+const float POLICY_FORWARD_MAX = POLICY_TARGET_VELOCITY;
+constexpr float POLICY_YAW_MIN = 0, POLICY_YAW_MAX = 0;
+constexpr float POLICY_LINEAR_ACCELERATION = 0.05f, POLICY_YAW_ACCELERATION = 1.0f;
+#endif
+
 constexpr int GRAVITY_OFFSET = HISTORY_DIM;
 constexpr int GYRO_OFFSET = GRAVITY_OFFSET + 3;
 constexpr int CLOCK_OFFSET = GYRO_OFFSET + 3;
 constexpr int TARGET_VELOCITY_OFFSET = CLOCK_OFFSET + 2;
-constexpr int HEADING_OFFSET = TARGET_VELOCITY_OFFSET + 1;
+constexpr int TARGET_YAW_OFFSET = TARGET_VELOCITY_OFFSET + 1;
+constexpr int HEADING_OFFSET = TARGET_YAW_OFFSET + POLICY_MOTION_COMMAND_VERSION;
 constexpr float PI_F = 3.14159265358979323846f;
 
+static_assert(POLICY_MOTION_COMMAND_VERSION == 0 || POLICY_MOTION_COMMAND_VERSION == 1,
+              "Unsupported motion command version");
 static_assert(ACTION_DIM == 8, "Rick v2 firmware expects eight servos");
 static_assert(HEADING_OFFSET + 2 * POLICY_HEADING_OBSERVATION == OBS_DIM,
               "Firmware observation layout does not match the exported policy");
@@ -72,8 +88,9 @@ constexpr int PIN_IMU_INT1 = 5;
 constexpr uint32_t BATTERY_DIVIDER_RATIO = 3;  // 200 kOhm / 100 kOhm divider.
 constexpr int BATTERY_ADC_SAMPLES = 8;
 
-// MuJoCo actuator order: left roll/upper/lower/foot, then right equivalents.
-constexpr int SERVO_PINS[ACTION_DIM] = {10, 11, 12, 13, 6, 7, 8, 9};
+// MuJoCo actuator order: right (Mirror) roll/upper/lower/foot, then left.
+// With -Y forward and +Z up, Rick's right side is -X in the model.
+constexpr int SERVO_PINS[ACTION_DIM] = {6, 7, 8, 9, 10, 11, 12, 13};
 constexpr bool servo_pins_are_valid() {
     for (int first = 0; first < ACTION_DIM; ++first) {
         if (SERVO_PINS[first] == PIN_IMU_SDA ||
@@ -87,12 +104,17 @@ constexpr bool servo_pins_are_valid() {
 }
 static_assert(servo_pins_are_valid(), "Servo and IMU GPIO assignments overlap");
 constexpr float SERVO_DIRS[ACTION_DIM] = {
-    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    // Right then left: roll, upper, knee, ankle. The six pitch joints need
+    // negative pulse polarity to match the model's knees-forward basic pose.
+    // Roll polarity is unchanged; its zero default target cannot verify it.
+    -1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f,
 };
 
 float SERVO_CENTERS_US[ACTION_DIM] = {
-    1340.0f, 1435.0f, 1535.0f, 1475.0f,
+    // Centers follow their physical servos in policy order: right, then left.
     1715.0f, 1595.0f, 1605.0f, 1560.0f,
+    1340.0f, 1435.0f, 1535.0f, 1475.0f,
 };
 
 constexpr float SERVO_US_PER_RAD = 1000.0f / (PI_F / 2.0f);
@@ -126,7 +148,16 @@ static_assert(IMU_ACCEL_RANGE_4G == 0x10 && rick::IMU_CALIBRATION_RANGE_G == 4.0
 
 float current_obs[OBS_DIM] = {0.0f};
 float target_actions[ACTION_DIM] = {0.0f};
+uint16_t applied_servo_pulse_us[ACTION_DIM] = {};
 rick::PolicyNetwork policy_network;
+rick::GaitDiagnostics gait_diagnostics;
+portMUX_TYPE gait_diagnostics_mutex = portMUX_INITIALIZER_UNLOCKED;
+
+void finish_gait_diagnostics(rick::GaitDiagnostics::Reason reason) {
+    portENTER_CRITICAL(&gait_diagnostics_mutex);
+    gait_diagnostics.finish(reason);
+    portEXIT_CRITICAL(&gait_diagnostics_mutex);
+}
 
 float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 constexpr float MADGWICK_BETA = 0.1f;
@@ -140,6 +171,22 @@ rick::ControlTiming control_timing;
 uint32_t step_counter = 0;
 float gait_phase = 0.0f;
 float heading_reference = 0.0f;
+rick::MotionCommand motion_command;
+rick::MotionCommand target_motion_command = {POLICY_TARGET_VELOCITY, 0.0f};
+const rick::MotionCommand motion_minimum = {POLICY_FORWARD_MIN, POLICY_YAW_MIN};
+const rick::MotionCommand motion_maximum = {POLICY_FORWARD_MAX, POLICY_YAW_MAX};
+const rick::MotionCommand motion_acceleration = {POLICY_LINEAR_ACCELERATION, POLICY_YAW_ACCELERATION};
+QueueHandle_t motion_command_queue = nullptr;
+// BLE reads a short snapshot; policy state itself is owned by the main loop.
+portMUX_TYPE motion_mutex = portMUX_INITIALIZER_UNLOCKED;
+int16_t requested_motion_units[2] = {int16_t(POLICY_TARGET_VELOCITY * 1000), 0};
+void set_target_motion(rick::MotionCommand command) {
+    target_motion_command = command;
+    portENTER_CRITICAL(&motion_mutex);
+    requested_motion_units[0] = int16_t(std::lround(command.forward * 1000));
+    requested_motion_units[1] = int16_t(std::lround(command.yaw * 1000));
+    portEXIT_CRITICAL(&motion_mutex);
+}
 rick::GyroBiasCalibration gyro_calibration(POLICY_GYRO_BIAS_CALIBRATION_SAMPLES);
 
 enum class ControlCommand : uint8_t {
@@ -256,6 +303,7 @@ constexpr char OTA_DATA_UUID[] = "7e57a006-4c91-4d8e-8f2a-7dca6d5a1000";
 constexpr char OTA_STATUS_UUID[] = "7e57a007-4c91-4d8e-8f2a-7dca6d5a1000";
 constexpr char BATTERY_UUID[] = "7e57a008-4c91-4d8e-8f2a-7dca6d5a1000";
 constexpr char IMU_RAW_UUID[] = "7e57a009-4c91-4d8e-8f2a-7dca6d5a1000";
+constexpr char GAIT_DIAGNOSTICS_UUID[] = "7e57a00a-4c91-4d8e-8f2a-7dca6d5a1000";
 
 uint64_t time_us_64() { return static_cast<uint64_t>(esp_timer_get_time()); }
 
@@ -462,7 +510,8 @@ int16_t clamp_to_int16(float value) {
         std::max(-32768.0f, std::min(32767.0f, value))));
 }
 
-bool read_imu(float *gx, float *gy, float *gz, float *ax, float *ay, float *az) {
+bool read_imu(float *gx, float *gy, float *gz, float *ax, float *ay, float *az,
+              int16_t *raw_counts = nullptr) {
     uint8_t buffer[12];
     if (!read_imu_registers(IMU_REG_ACC_DATA_XL, buffer, sizeof(buffer))) return false;
     const int16_t raw_ax = static_cast<int16_t>(buffer[1]<<8 | buffer[0]);
@@ -471,12 +520,17 @@ bool read_imu(float *gx, float *gy, float *gz, float *ax, float *ay, float *az) 
     const int16_t raw_gx = static_cast<int16_t>(buffer[7]<<8 | buffer[6]);
     const int16_t raw_gy = static_cast<int16_t>(buffer[9]<<8 | buffer[8]);
     const int16_t raw_gz = static_cast<int16_t>(buffer[11]<<8 | buffer[10]);
+    if (raw_counts) {
+        const int16_t counts[6] = {raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz};
+        std::memcpy(raw_counts, counts, sizeof(counts));
+    }
     const float pgx=raw_gx*GYRO_SCALE_RAD_S, pgy=raw_gy*GYRO_SCALE_RAD_S;
     const float pgz=raw_gz*GYRO_SCALE_RAD_S;
     const auto sensor_accel = rick::calibrated_sensor_accel(raw_ax, raw_ay, raw_az);
-    const rick::ImuVector3 robot_accel = rick::sensor_to_robot_axes(
-        sensor_accel.x, sensor_accel.y, sensor_accel.z);
-    const rick::ImuVector3 robot_gyro = rick::sensor_to_robot_axes(pgx, pgy, pgz);
+    const rick::ImuVector3 robot_accel = rick::correct_imu_mounting(rick::sensor_to_robot_axes(
+        sensor_accel.x, sensor_accel.y, sensor_accel.z));
+    const rick::ImuVector3 robot_gyro = rick::correct_imu_mounting(
+        rick::sensor_to_robot_axes(pgx, pgy, pgz));
     imu_telemetry[0]=clamp_to_int16(robot_accel.x*1000);
     imu_telemetry[1]=clamp_to_int16(robot_accel.y*1000);
     imu_telemetry[2]=clamp_to_int16(robot_accel.z*1000);
@@ -536,10 +590,62 @@ void update_servos(const float *actions, bool use_default_pose=true) {
     }
     for (int i=0;i<ACTION_DIM;++i) {
         const auto channel=static_cast<ledc_channel_t>(i);
+        const float pulse = servo_pulse_width_us(i,actions[i],use_default_pose);
         ledc_set_duty(LEDC_LOW_SPEED_MODE, channel,
-            servo_duty(servo_pulse_width_us(i,actions[i],use_default_pose)));
+            servo_duty(pulse));
         ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
+        applied_servo_pulse_us[i] = uint16_t(std::lround(pulse));
     }
+}
+
+void start_gait_diagnostics() {
+    rick::GaitDiagnostics::Metadata meta;
+    meta.checkpoint = POLICY_CHECKPOINT_STEP;
+    meta.control_dt = POLICY_CONTROL_DT; meta.frequency = POLICY_STEP_FREQUENCY;
+    meta.target_velocity = POLICY_TARGET_VELOCITY; meta.action_scale = POLICY_ACTION_SCALE_RAD;
+    meta.heading_reference = heading_reference; meta.gyro_scale = GYRO_SCALE_RAD_S;
+    meta.gyro_obs_scale = POLICY_GYRO_OBS_SCALE; meta.beta = MADGWICK_BETA;
+    meta.obs_dim = OBS_DIM; meta.heading_enabled = POLICY_HEADING_OBSERVATION;
+    meta.calibration_enabled = POLICY_GYRO_BIAS_CALIBRATION;
+    // Three cycles plus the initial control interval, bounded independently of
+    // a checkpoint's cadence. Slow checkpoints get a clearly bounded 4.5 s log.
+    meta.duration_us = uint32_t(std::min(4500000.0f,
+        3000000.0f / std::max(POLICY_STEP_FREQUENCY, 0.1f) + CONTROL_PERIOD_US));
+    meta.accel_config = IMU_ACCEL_RANGE_4G | IMU_ODR_110_HZ;
+    meta.gyro_config = IMU_GYRO_RANGE_2000_DPS | IMU_ODR_110_HZ;
+    meta.accel_zero[0] = rick::IMU_ACCEL_ZERO_COUNTS.x;
+    meta.accel_zero[1] = rick::IMU_ACCEL_ZERO_COUNTS.y;
+    meta.accel_zero[2] = rick::IMU_ACCEL_ZERO_COUNTS.z;
+    meta.accel_counts_per_g = rick::IMU_ACCEL_COUNTS_PER_G;
+    meta.mounting_calibration_id = rick::IMU_MOUNTING_CALIBRATION_ID;
+    const float quat[4] = {q0, q1, q2, q3};
+    std::memcpy(meta.initial_quat, quat, sizeof(quat));
+    std::memcpy(meta.initial_action, target_actions, sizeof(target_actions));
+    for (int i = 0; i < 3; ++i)
+        meta.bias[i] = POLICY_GYRO_BIAS_CALIBRATION ? gyro_calibration.bias(i) : 0.0f;
+    for (int i = 0; i < ACTION_DIM; ++i) meta.centers[i] = uint16_t(std::lround(SERVO_CENTERS_US[i]));
+    std::strncpy(meta.build, __DATE__ " " __TIME__, sizeof(meta.build) - 1);
+    portENTER_CRITICAL(&gait_diagnostics_mutex);
+    gait_diagnostics.start(time_us_64(), meta);
+    portEXIT_CRITICAL(&gait_diagnostics_mutex);
+}
+
+void record_gait_diagnostics(rick::GaitDiagnostics::Frame &frame) {
+    const float quat[4] = {q0, q1, q2, q3};
+    std::memcpy(frame.quat, quat, sizeof(quat));
+    get_local_gravity(frame.gravity);
+    frame.phase = gait_phase;
+    frame.heading = rick::heading_from_quat(q0, q1, q2, q3);
+    std::memcpy(frame.action, target_actions, sizeof(target_actions));
+    std::memcpy(frame.pulse_us, applied_servo_pulse_us, sizeof(applied_servo_pulse_us));
+    frame.read_errors = imu_read_errors;
+    if (gyro_calibration.ready()) frame.flags |= rick::GaitDiagnostics::BIAS_READY;
+    if (servo_outputs_enabled) frame.flags |= rick::GaitDiagnostics::PWM_ENABLED;
+    for (int i = 0; i < 3; ++i)
+        frame.bias[i] = POLICY_GYRO_BIAS_CALIBRATION ? gyro_calibration.bias(i) : 0.0f;
+    portENTER_CRITICAL(&gait_diagnostics_mutex);
+    gait_diagnostics.record(frame, robot_running);
+    portEXIT_CRITICAL(&gait_diagnostics_mutex);
 }
 
 void reset_policy_history_and_clock(float previous_action) {
@@ -548,13 +654,16 @@ void reset_policy_history_and_clock(float previous_action) {
     std::fill(std::begin(current_obs),std::end(current_obs),0.0f);
     std::fill(current_obs,current_obs+HISTORY_DIM,previous_action);
     current_obs[CLOCK_OFFSET]=0; current_obs[CLOCK_OFFSET+1]=1;
-    current_obs[TARGET_VELOCITY_OFFSET]=POLICY_TARGET_VELOCITY;
+    motion_command = {};
+    current_obs[TARGET_VELOCITY_OFFSET]=POLICY_MOTION_COMMAND_VERSION ? 0 : POLICY_TARGET_VELOCITY;
+    if constexpr(POLICY_MOTION_COMMAND_VERSION) current_obs[TARGET_YAW_OFFSET]=0;
     heading_reference=rick::heading_from_quat(q0,q1,q2,q3);
     if constexpr(POLICY_HEADING_OBSERVATION)
         rick::relative_heading_observation(heading_reference,heading_reference,
                                             &current_obs[HEADING_OFFSET]);
 }
 void reset_servos(float action, bool use_default_pose=true) {
+    finish_gait_diagnostics(rick::GaitDiagnostics::RESET);
     robot_running=false; std::fill(std::begin(target_actions),std::end(target_actions),action);
     reset_policy_history_and_clock(action); update_servos(target_actions,use_default_pose);
 }
@@ -601,8 +710,11 @@ void apply_control_command(ControlCommand command) {
         gyro_calibration.reset_window();reset_policy_history_and_clock(target_actions[0]);
         for(int h=0;h<HISTORY_LEN;++h)for(int a=0;a<ACTION_DIM;++a)
             current_obs[h*ACTION_DIM+a]=target_actions[a];
+        start_gait_diagnostics();
         robot_running=true;control_state=CONTROL_STATE_RUNNING;printf("Bluetooth command: start policy.\n");break;
-    case ControlCommand::STOP: robot_running=false;control_schedule.reset(time_us_64());
+    case ControlCommand::STOP: finish_gait_diagnostics(rick::GaitDiagnostics::STOP);
+        robot_running=false;control_schedule.reset(time_us_64());
+        if constexpr(POLICY_MOTION_COMMAND_VERSION) set_target_motion({});
         control_state=servo_outputs_enabled ? CONTROL_STATE_STOPPED : CONTROL_STATE_RELAXED;
         printf("Bluetooth command: stop policy.\n");break;
     case ControlCommand::SLEEP: case ControlCommand::WAKE: break;
@@ -614,6 +726,7 @@ template<typename T> void drain_queue(QueueHandle_t queue){T item;while(xQueueRe
 bool power_down_imu() { return write_imu_register(0x30, 0x07); }
 
 void enter_robot_sleep() {
+    finish_gait_diagnostics(rick::GaitDiagnostics::SLEEP);
     robot_running = false;
     servo_calibration_active = false;
     cancel_imu_raw();
@@ -628,6 +741,8 @@ void enter_robot_sleep() {
     drain_queue<uint8_t>(control_command_queue);
     drain_queue<ServoCalibrationCommand>(servo_calibration_command_queue);
     drain_queue<ImuRawCommand>(imu_raw_command_queue);
+    drain_queue<rick::MotionCommand>(motion_command_queue);
+    if constexpr(POLICY_MOTION_COMMAND_VERSION) set_target_motion({});
     drain_queue<OtaControlPacket>(ota_control_queue);
     drain_queue<OtaDataPacket>(ota_data_queue);
     stop_requested = false;
@@ -691,10 +806,14 @@ void wake_robot() {
 }
 
 void process_control_commands(){
-    if(stop_requested){stop_requested=false;drain_queue<uint8_t>(control_command_queue);
+    if(stop_requested){stop_requested=false;
+        rick::MotionCommand discarded; xQueueReceive(motion_command_queue, &discarded, 0);drain_queue<uint8_t>(control_command_queue);
         drain_queue<ImuRawCommand>(imu_raw_command_queue);
         drain_queue<ServoCalibrationCommand>(servo_calibration_command_queue);
         apply_control_command(ControlCommand::STOP);return;}
+    rick::MotionCommand motion;
+    if (xQueueReceive(motion_command_queue, &motion, 0) == pdTRUE &&
+        !robot_sleeping && !imu_raw_locks_robot()) set_target_motion(motion);
     uint8_t value;while(xQueueReceive(control_command_queue,&value,0)==pdTRUE)
         apply_control_command(static_cast<ControlCommand>(value));
 }
@@ -708,6 +827,7 @@ void process_imu_raw_commands() {
         if (command.pose == 0) {
             if (command.token == imu_raw_capture.token) cancel_imu_raw();
         } else if (!imu_raw_locks_robot()) {
+            finish_gait_diagnostics(rick::GaitDiagnostics::RAW_TEST);
             robot_running = false;
             servo_calibration_active = false;
             control_state = CONTROL_STATE_STOPPED;
@@ -726,7 +846,8 @@ void update_imu_and_clock_observation(float gx,float gy,float gz){
     current_obs[GYRO_OFFSET+1]=POLICY_GYRO_OBS_SCALE*gy;
     current_obs[GYRO_OFFSET+2]=POLICY_GYRO_OBS_SCALE*gz;
     current_obs[CLOCK_OFFSET]=std::sin(gait_phase);current_obs[CLOCK_OFFSET+1]=std::cos(gait_phase);
-    current_obs[TARGET_VELOCITY_OFFSET]=POLICY_TARGET_VELOCITY;
+    current_obs[TARGET_VELOCITY_OFFSET]=POLICY_MOTION_COMMAND_VERSION ? motion_command.forward : POLICY_TARGET_VELOCITY;
+    if constexpr(POLICY_MOTION_COMMAND_VERSION) current_obs[TARGET_YAW_OFFSET]=motion_command.yaw;
     if constexpr(POLICY_HEADING_OBSERVATION)rick::relative_heading_observation(
         rick::heading_from_quat(q0,q1,q2,q3),heading_reference,&current_obs[HEADING_OFFSET]);
     for(float &value:current_obs)value=std::max(-10.0f,std::min(10.0f,value));
@@ -756,6 +877,7 @@ void ota_reset(){ota_abort_writer();ota_cleanup_hash();drain_queue<OtaDataPacket
     ota_digest_bytes_received=ota_total_bytes=ota_bytes_received=ota_chunks_received=0;
     ota_target_partition=0xff;ota_partition=nullptr;ota_error=OtaError::NONE;ota_state=OtaState::IDLE;}
 void stop_robot_for_update(){stop_requested=false;robot_running=false;servo_calibration_active=false;
+    finish_gait_diagnostics(rick::GaitDiagnostics::OTA);
     cancel_imu_raw();drain_queue<ImuRawCommand>(imu_raw_command_queue);
     control_schedule.reset(time_us_64());control_state=CONTROL_STATE_STOPPED;
     drain_queue<uint8_t>(control_command_queue);drain_queue<ServoCalibrationCommand>(servo_calibration_command_queue);}
@@ -821,10 +943,22 @@ void process_ota_abort_request(){if(!ota_abort_requested)return;ota_abort_reques
 void set_value(BLECharacteristic *characteristic,const uint8_t *data,size_t length){
     characteristic->setValue(const_cast<uint8_t*>(data),length);}
 class RickCharacteristicCallbacks:public BLECharacteristicCallbacks{
-public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY,IMU_RAW};
+public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY,IMU_RAW,GAIT_DIAGNOSTICS};
     explicit RickCharacteristicCallbacks(Kind kind):kind_(kind){}
     void onRead(BLECharacteristic *c)override{
-        if(kind_==Kind::CONTROL){const uint8_t state[3]={control_state,1,uint8_t(wake_error)};set_value(c,state,sizeof(state));}
+        if(kind_==Kind::GAIT_DIAGNOSTICS){uint8_t b[rick::GaitDiagnostics::FRAME_SIZE];
+            portENTER_CRITICAL(&gait_diagnostics_mutex);
+            const unsigned size=gait_diagnostics.encode(b);
+            portEXIT_CRITICAL(&gait_diagnostics_mutex);set_value(c,b,size);return;}
+        if(kind_==Kind::CONTROL){
+            uint8_t state[16]={control_state,1,uint8_t(wake_error),POLICY_MOTION_COMMAND_VERSION};
+            const int16_t limits[4] = {int16_t(std::lround(POLICY_FORWARD_MIN*1000)),
+                int16_t(std::lround(POLICY_FORWARD_MAX*1000)),int16_t(std::lround(POLICY_YAW_MIN*1000)),
+                int16_t(std::lround(POLICY_YAW_MAX*1000))};
+            for(int i=0;i<4;++i){state[4+2*i]=uint16_t(limits[i]);state[5+2*i]=uint16_t(limits[i])>>8;}
+            portENTER_CRITICAL(&motion_mutex);
+            for(int i=0;i<2;++i){state[12+2*i]=uint16_t(requested_motion_units[i]);state[13+2*i]=uint16_t(requested_motion_units[i])>>8;}
+            portEXIT_CRITICAL(&motion_mutex);set_value(c,state,sizeof(state));}
         else if(kind_==Kind::IMU_RAW){uint8_t b[rick::ImuRawCapture::PACKET_SIZE];
             portENTER_CRITICAL(&imu_raw_mutex);std::memcpy(b,imu_raw_packet,sizeof(b));portEXIT_CRITICAL(&imu_raw_mutex);
             set_value(c,b,sizeof(b));}
@@ -837,12 +971,24 @@ public:enum class Kind{CONTROL,IMU,SERVO,OTA_CONTROL,OTA_DATA,OTA_STATUS,BATTERY
                 uint8_t(running->subtype-ESP_PARTITION_SUBTYPE_APP_OTA_MIN):0xff;b[19]=1;write_u32(&b[28],ESP32_S3_FAMILY_ID);set_value(c,b,sizeof(b));}}
     void onWrite(BLECharacteristic *c)override{const std::string value=c->getValue();
         const auto *data=reinterpret_cast<const uint8_t*>(value.data());const size_t size=value.size();
+        if(kind_==Kind::GAIT_DIAGNOSTICS){
+            portENTER_CRITICAL(&gait_diagnostics_mutex);
+            if(size==1&&data[0]==0)gait_diagnostics.select_header();
+            else if(size==7&&data[0]==1)gait_diagnostics.select_frame(read_u32(data+1),
+                uint16_t(data[5])|(uint16_t(data[6])<<8));
+            portEXIT_CRITICAL(&gait_diagnostics_mutex);return;}
         if(control_state==CONTROL_STATE_WAKING)return;
         if(robot_sleeping && (kind_!=Kind::CONTROL || size!=1 || data[0]!=uint8_t(ControlCommand::WAKE)))return;
         if(kind_==Kind::IMU_RAW){if(ota_locks_robot()||size!=4||data[0]!=1||data[3]>6)return;
             const ImuRawCommand command={uint16_t(uint16_t(data[1])|(uint16_t(data[2])<<8)),data[3]};
             xQueueSend(imu_raw_command_queue,&command,0);return;}
-        if(kind_==Kind::CONTROL){if(ota_locks_robot()||size!=1||data[0]>uint8_t(ControlCommand::WAKE))return;
+        if(kind_==Kind::CONTROL){
+            if(POLICY_MOTION_COMMAND_VERSION && !ota_locks_robot() && !imu_raw_locks_robot()) {
+                rick::MotionCommand motion;
+                if(rick::decode_motion_command(data,size,motion_minimum,motion_maximum,motion)){
+                    xQueueOverwrite(motion_command_queue,&motion);return;}
+            }
+            if(ota_locks_robot()||size!=1||data[0]>uint8_t(ControlCommand::WAKE))return;
             if(data[0]==uint8_t(ControlCommand::STOP))stop_requested=true;else xQueueSend(control_command_queue,data,0);}
         else if(kind_==Kind::SERVO){if(ota_locks_robot()||size!=3)return;const int16_t delta=int16_t(uint16_t(data[1])|(uint16_t(data[2])<<8));
             const bool finish=data[0]==SERVO_CALIBRATION_FINISH;if((finish&&delta)||( !finish&&(data[0]>=ACTION_DIM||!delta||delta< -SERVO_CALIBRATION_MAX_STEP_US||delta>SERVO_CALIBRATION_MAX_STEP_US)))return;
@@ -894,7 +1040,7 @@ BLECharacteristic *create_characteristic(BLEService *service,const char *uuid,ui
     c->setAccessPermissions(permissions);c->setCallbacks(new RickCharacteristicCallbacks(kind));return c;}
 bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *server=BLEDevice::createServer();
     ESP_ERROR_CHECK(esp_bt_sleep_enable());
-    server->setCallbacks(new RickServerCallbacks());auto *service=server->createService(BLEUUID(SERVICE_UUID),32);
+    server->setCallbacks(new RickServerCallbacks());auto *service=server->createService(BLEUUID(SERVICE_UUID),36);
     create_characteristic(service,CONTROL_UUID,BLECharacteristic::PROPERTY_READ|BLECharacteristic::PROPERTY_WRITE,
         esp_gatt_perm_t(ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE_ENCRYPTED),RickCharacteristicCallbacks::Kind::CONTROL);
     create_characteristic(service,IMU_UUID,BLECharacteristic::PROPERTY_READ,ESP_GATT_PERM_READ,RickCharacteristicCallbacks::Kind::IMU);
@@ -906,6 +1052,8 @@ bool init_bluetooth(){BLEDevice::init("RickBot");BLEDevice::setMTU(517);auto *se
     create_characteristic(service,BATTERY_UUID,BLECharacteristic::PROPERTY_READ,ESP_GATT_PERM_READ,RickCharacteristicCallbacks::Kind::BATTERY);
     create_characteristic(service,IMU_RAW_UUID,BLECharacteristic::PROPERTY_READ|BLECharacteristic::PROPERTY_WRITE,
         esp_gatt_perm_t(ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE_ENCRYPTED),RickCharacteristicCallbacks::Kind::IMU_RAW);
+    create_characteristic(service,GAIT_DIAGNOSTICS_UUID,BLECharacteristic::PROPERTY_READ|BLECharacteristic::PROPERTY_WRITE,
+        esp_gatt_perm_t(ESP_GATT_PERM_READ_ENCRYPTED|ESP_GATT_PERM_WRITE_ENCRYPTED),RickCharacteristicCallbacks::Kind::GAIT_DIAGNOSTICS);
     service->start();auto *security=new BLESecurity();security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
     security->setCapability(ESP_IO_CAP_NONE);security->setKeySize(16);
     security->setInitEncryptionKey(esp_ble_key_type_t(ESP_BLE_ENC_KEY_MASK|ESP_BLE_ID_KEY_MASK));
@@ -921,10 +1069,11 @@ void setup(){neopixelWrite(PIN_STATUS_LED, 16, 16, 16);Serial.begin(115200);dela
     getCpuFrequencyMhz(),static_cast<unsigned long>(CONTROL_PERIOD_US));
     init_power_management();
     init_battery_monitor();
+    motion_command_queue=xQueueCreate(1,sizeof(rick::MotionCommand));
     control_command_queue=xQueueCreate(8,sizeof(uint8_t));servo_calibration_command_queue=xQueueCreate(8,sizeof(ServoCalibrationCommand));
     imu_raw_command_queue=xQueueCreate(4,sizeof(ImuRawCommand));
     ota_control_queue=xQueueCreate(4,sizeof(OtaControlPacket));ota_data_queue=xQueueCreate(8,sizeof(OtaDataPacket));
-    if(!control_command_queue||!servo_calibration_command_queue||!imu_raw_command_queue||!ota_control_queue||!ota_data_queue){printf("Could not allocate command queues.\n");abort();}
+    if(!motion_command_queue||!control_command_queue||!servo_calibration_command_queue||!imu_raw_command_queue||!ota_control_queue||!ota_data_queue){printf("Could not allocate command queues.\n");abort();}
     if(!init_imu()){printf("Tokmas ICM-42688-P initialization failed; servos remain disabled.\n");
         while(true)delay(1000);}
     init_servos();reset_servos(0);control_state=CONTROL_STATE_DEFAULT;
@@ -944,17 +1093,65 @@ void loop(){
         imu_raw_capture.tick(imu_raw_io,time_us_64());publish_imu_raw();
         control_schedule.reset(time_us_64());imu_clock.reset();delay(1);return;}
     const uint64_t now=time_us_64();if(ota_locks_robot()){control_schedule.reset(now);imu_clock.reset();}
-    else{uint64_t skipped=0;if(control_schedule.take(now,skipped)){float gx,gy,gz,ax,ay,az;
-        if(!read_imu(&gx,&gy,&gz,&ax,&ay,&az)){++imu_consecutive_read_errors;if((++imu_read_errors&0x3f)==1)printf("Tokmas IMU I2C read failed (%lu errors).\n",static_cast<unsigned long>(imu_read_errors));if(imu_consecutive_read_errors>=3)stop_requested=true;imu_clock.reset();delay(0);return;}imu_consecutive_read_errors=0;
-        const uint64_t sample=time_us_64();const float imu_dt=imu_clock.step(sample,POLICY_CONTROL_DT);
-        if constexpr(POLICY_GYRO_BIAS_CALIBRATION){const float gyro[3]={gx,gy,gz},accel[3]={ax,ay,az};
-            if(skipped||imu_dt>1.5f*POLICY_CONTROL_DT)gyro_calibration.reset_window();
-            if(gyro_calibration.observe(gyro,accel,!robot_running&&!servo_calibration_active))printf("Gyro bias calibrated: %.5f %.5f %.5f rad/s.\n",
-                gyro_calibration.bias(0),gyro_calibration.bias(1),gyro_calibration.bias(2));
-            gx-=gyro_calibration.bias(0);gy-=gyro_calibration.bias(1);gz-=gyro_calibration.bias(2);}
-        madgwick_update_6dof(gx,gy,gz,ax,ay,az,imu_dt);if(robot_running){gait_phase=gait_clock.sample(sample,POLICY_STEP_FREQUENCY);
-            update_imu_and_clock_observation(gx,gy,gz);const uint64_t started=time_us_64();policy_network.infer(current_obs,target_actions);
-            const uint64_t inference=time_us_64()-started;update_servos(target_actions);append_command_history(target_actions);++step_counter;
-            const uint64_t finished=time_us_64();control_timing.record(now,finished,inference,skipped,control_schedule.next_us());report_control_timing(finished);}}}
+    else {
+        uint64_t skipped = 0;
+        if (control_schedule.take(now, skipped)) {
+            rick::GaitDiagnostics::Frame frame;
+            frame.skipped = uint32_t(skipped);
+            float gx, gy, gz, ax, ay, az;
+            if (!read_imu(&gx, &gy, &gz, &ax, &ay, &az, frame.raw)) {
+                ++imu_consecutive_read_errors;
+                if ((++imu_read_errors & 0x3f) == 1)
+                    printf("Tokmas IMU I2C read failed (%lu errors).\n", static_cast<unsigned long>(imu_read_errors));
+                if (imu_consecutive_read_errors >= 3) stop_requested = true;
+                // Explicit failed sample, not a duplicate of the preceding IMU.
+                frame.time_us = time_us_64(); frame.imu_dt = NAN;
+                for (int i = 0; i < 3; ++i)
+                    frame.accel[i] = frame.gyro_before[i] = frame.gyro[i] = NAN;
+                frame.control_us = uint32_t(frame.time_us - now);
+                record_gait_diagnostics(frame);
+                imu_clock.reset(); delay(0); return;
+            }
+            imu_consecutive_read_errors = 0;
+            const uint64_t sample = time_us_64();
+            const float imu_dt = imu_clock.step(sample, POLICY_CONTROL_DT);
+            frame.time_us = sample; frame.imu_dt = imu_dt;
+            frame.flags = rick::GaitDiagnostics::READ_OK;
+            for (int16_t value : frame.raw)
+                if (value <= -32760 || value >= 32760) frame.flags |= rick::GaitDiagnostics::RAW_CLIPPED;
+            const float gyro[3] = {gx, gy, gz}, accel[3] = {ax, ay, az};
+            std::memcpy(frame.accel, accel, sizeof(accel));
+            std::memcpy(frame.gyro_before, gyro, sizeof(gyro));
+            if constexpr (POLICY_GYRO_BIAS_CALIBRATION) {
+                if (skipped || imu_dt > 1.5f * POLICY_CONTROL_DT) gyro_calibration.reset_window();
+                if (gyro_calibration.observe(gyro, accel, !robot_running && !servo_calibration_active))
+                    printf("Gyro bias calibrated: %.5f %.5f %.5f rad/s.\n",
+                        gyro_calibration.bias(0), gyro_calibration.bias(1), gyro_calibration.bias(2));
+                gx -= gyro_calibration.bias(0); gy -= gyro_calibration.bias(1); gz -= gyro_calibration.bias(2);
+            }
+            frame.gyro[0] = gx; frame.gyro[1] = gy; frame.gyro[2] = gz;
+            madgwick_update_6dof(gx, gy, gz, ax, ay, az, imu_dt);
+            if (robot_running) {
+                if constexpr(POLICY_MOTION_COMMAND_VERSION)
+                    rick::step_motion_command(motion_command, target_motion_command,
+                        motion_acceleration, imu_dt, heading_reference);
+                gait_phase = gait_clock.sample(sample, POLICY_STEP_FREQUENCY);
+                update_imu_and_clock_observation(gx, gy, gz);
+                const uint64_t started = time_us_64();
+                policy_network.infer(current_obs, target_actions);
+                frame.inference_us = uint32_t(time_us_64() - started);
+                update_servos(target_actions); append_command_history(target_actions);
+                frame.step = step_counter++;
+                frame.flags |= rick::GaitDiagnostics::POLICY_APPLIED;
+            }
+            frame.control_us = uint32_t(time_us_64() - now);
+            record_gait_diagnostics(frame);
+            if (robot_running) {
+                const uint64_t finished = time_us_64();
+                control_timing.record(now, finished, frame.inference_us, skipped, control_schedule.next_us());
+                report_control_timing(finished);
+            }
+        }
+    }
     delay(0);}
 #endif

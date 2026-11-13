@@ -18,8 +18,8 @@ constexpr ImuVector3 sensor_to_robot_axes(float sensor_x, float sensor_y,
     return {-sensor_z, sensor_x, sensor_y};
 }
 
-// The policy/MuJoCo frame is +X right, -Y forward, +Z up. Convert the
-// right/down/forward robot frame before updating attitude or observations.
+// The policy/MuJoCo frame is +X left, -Y forward, +Z up. Convert the
+// telemetry frame before updating attitude or observations.
 constexpr ImuVector3 robot_to_policy_axes(const ImuVector3 &robot) {
     return {robot.x, -robot.z, -robot.y};
 }

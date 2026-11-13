@@ -131,5 +131,72 @@ class HeadingConfigurationTest(unittest.TestCase):
             export_policy._validate_configuration(config, env)
 
 
+class MotionConfigurationTest(unittest.TestCase):
+    def config(self):
+        return {
+            "observation_size": {"shape": [108]}, "action_size": 8,
+            "normalize_observations": True,
+            "network_factory_kwargs": {"policy_hidden_layer_sizes": [128],
+                "activation": "silu", "distribution_type": "tanh_normal"},
+        }, {
+            "command_history_length": 12, "heading_observation": True,
+            "gyro_bias_calibration": True, "motion_command_version": 1,
+            "forward_velocity_range": [-.04,.08], "yaw_rate_range": [-.6,.6],
+            "linear_acceleration_limit": .05, "yaw_acceleration_limit": 1.,
+            "target_velocity": .05,
+        }
+
+    def test_command_layout_and_limits(self):
+        net, env = self.config()
+        self.assertEqual(export_policy._validate_configuration(net, env)[0], 108)
+        for key, value in [("motion_command_version", 2),
+                           ("forward_velocity_range", [0.01, .08]),
+                           ("yaw_rate_range", [-float("inf"), .6]),
+                           ("yaw_rate_range", [-40, 40]),
+                           ("forward_velocity_range", [-.0405, .08]),
+                           ("linear_acceleration_limit", 0),
+                           ("heading_observation", False),
+                           ("target_velocity", .09)]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                _, changed = self.config()
+                changed[key] = value
+                export_policy._validate_configuration(net, changed)
+        net["observation_size"]["shape"] = [107]
+        with self.assertRaisesRegex(ValueError, "observation mismatch"):
+            export_policy._validate_configuration(net, env)
+
+    def test_generated_motion_header_and_inference_compile(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "checkpoints" / "000000001"
+            checkpoint.mkdir(parents=True)
+            net, env = self.config()
+            net['network_factory_kwargs']['policy_hidden_layer_sizes'] = []
+            env.update(ctrl_dt=.02, step_frequency=1.5, gyro_obs_scale=.25, action_scale=.5)
+            (checkpoint / 'ppo_network_config.json').write_text(json.dumps(net))
+            (checkpoint.parent / 'config.json').write_text(json.dumps(env))
+            restored = [
+                {'mean': np.zeros(108, dtype=np.float32), 'std': np.ones(108, dtype=np.float32)},
+                {'params': {'hidden_0': {'kernel': np.zeros((108,16), dtype=np.float32),
+                                         'bias': np.zeros(16, dtype=np.float32)}}},
+            ]
+            with mock.patch.object(export_policy, '_restore_checkpoint', return_value=restored):
+                header, _, error = export_policy._build_header(checkpoint)
+            self.assertIn('#define POLICY_MOTION_COMMAND_VERSION 1', header)
+            self.assertIn('POLICY_FORWARD_MIN', header)
+            self.assertIn('POLICY_YAW_ACCELERATION', header)
+            self.assertEqual(error, 0)
+            (root / 'policy_weights.h').write_text(header)
+            (root / 'policy_inference.h').write_text(Path('policy_inference.h').read_text())
+            (root / 'infer.cpp').write_text(
+                '#include "policy_inference.h"\n#include <cassert>\n'
+                'int main(){float obs[108]={},action[8]; rick::PolicyNetwork net; '
+                'net.infer(obs,action); for(float x:action) assert(x==0);}'
+            )
+            subprocess.run(['c++','-std=c++17',str(root/'infer.cpp'),'-o',str(root/'infer')], check=True)
+            subprocess.run([str(root/'infer')], check=True)
+
+
 if __name__ == "__main__":
     unittest.main()

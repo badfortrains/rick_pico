@@ -31,6 +31,18 @@ provide the ESP-IDF build entry points.
 | Tokmas ICM-42688-P | INT1 | 5 |
 | Battery sense | J2 pin 4 / BAT_ADC | 1 |
 
+Policy outputs and servo-center calibration use right roll/upper/lower/foot
+first (GPIO6–9), then left (GPIO10–13). The right leg is the XML's `Mirror`
+chain at negative X: with forward at -Y and up at +Z, the model's +X is Rick's
+left. Keep each center calibration attached to its physical servo when
+changing the pin mapping. Update the Bluetooth controller together with the
+firmware so its calibration labels match this order.
+
+In that order, `SERVO_DIRS` is `{+1, -1, -1, -1, +1, -1, -1, -1}`.
+The six pitch signs restore the measured knees-forward default stance after
+correcting the leg banks. Roll signs retain their existing values and need
+an individual motion check; the default roll targets are zero.
+
 Battery sensing measures the 2S pack through R15 + R16 (200 kOhm total)
 over R17 (100 kOhm), with C23 (100 nF) filtering. At a fully charged 8.4 V,
 GPIO1 sees 2.8 V. Use `ADC_11db` in the pinned Arduino core (about 3.1 V
@@ -47,7 +59,7 @@ as an input but the 50 Hz controller currently polls the 110 Hz sensor stream.
 The axis transform matches the installed PCB with its component side facing the
 robot's left, its servo bank facing forward, S1 above S8, and the power plug at
 the back/top. Bluetooth telemetry is right/down/forward; attitude estimation
-and policy observations are converted again to MuJoCo's right/back/up frame.
+and policy observations are converted again to MuJoCo's left/back/up frame.
 
 `imu_calibration.h` applies the offset and sensitivity measured on this assembled
 Rick's accelerometer before both live telemetry and attitude estimation. At the
@@ -55,6 +67,14 @@ normal +/-4 g setting, its effective sensitivity is about 4093 counts/g, with
 sensor-frame zero offsets around -7369/-6731/-7105 counts. These values are
 specific to this IMU, not general Tokmas defaults. The raw-count test bypasses
 this correction. See [the measurement and validation notes](IMU_RAW_TEST.md).
+
+`imu_mounting.h` additionally rotates both acceleration and gyro into the level
+chassis frame, before telemetry, attitude estimation, and policy observations.
+This fixed mounting correction was measured with the chassis level on
+2026-11-12 (about 4.02 degrees pitch and 0.81 degrees roll in policy axes).
+It preserves acceleration magnitude and leaves startup gyro-bias calibration
+enabled. Repeat the level capture if the PCB mounting changes. Raw-count tests
+bypass this rotation as well as the sensor calibration.
 
 GPIO21 is not used because it drives the ESP32-S3-Zero's onboard WS2812. The
 USB D-/D+ pins, GPIO19 and GPIO20, are also left free. The eight servos need an
@@ -98,13 +118,14 @@ beyond one slot.
 
 `policy_weights.h` contains the network parameters and deployment constants
 exported with the training run. The controller maintains command history,
-projected gravity, body-frame gyro, gait clock, target velocity, and optional
-relative-heading observations. Policy inference and servo updates run at the
+projected gravity, body-frame gyro, gait clock, commanded forward speed and
+turn rate, and heading error relative to the integrated turn command. Policy inference and servo updates run at the
 exported 50 Hz control rate.
 
 The firmware continuously settles its Madgwick attitude estimate while
 stopped. Heading-aware policies capture a fresh relative heading when Start is
-pressed. If gyro-bias calibration is enabled in the exported header, keep Rick
+pressed. Command policies integrate the smoothed turn rate into that reference,
+so steering holds the new heading when returned to zero. If gyro-bias calibration is enabled in the exported header, keep Rick
 still for the reported calibration interval after boot.
 
 To export a different checkpoint, use the Python environment containing
@@ -133,7 +154,9 @@ The controller provides:
 - reset to the exported default pose;
 - reset every servo to its raw calibrated center pulse;
 - start and stop policy inference;
+- forward/reverse speed and left/right steering, plus Straighten and Stand;
 - live physical-frame accelerometer and gyro checks;
+- buffered first-step IMU/attitude/servo diagnostics, downloadable after Stop;
 - live battery-voltage monitoring from GPIO1 / ADC1 through the 3:1 divider;
 - live servo-center calibration;
 - encrypted wireless firmware updates.
@@ -142,6 +165,50 @@ Disconnecting Bluetooth stops the policy and holds the last servo command
 when PWM is enabled. Sleeping or released servos stay released.
 Servo-center changes are kept only in RAM; copy the generated
 `SERVO_CENTERS_US` declaration into `main.cpp` and rebuild to preserve them.
+
+For a first-step drag or pivot, use **First-step diagnostics → Fetch last Start**
+after stopping, then **Save JSON**. Each Start automatically records pre-motion
+samples and the first three gait cycles. See [capture instructions and field
+definitions](GAIT_DIAGNOSTICS.md).
+
+## Training speed and steering
+
+Train a **new** `RickJoystickFlatTerrain` run in `mujoco_playground`. Old
+checkpoints have a different observation contract and are rejected for restore.
+The default policy observation has 108 inputs: 96 servo-command history values,
+3 gravity, 3 gyro, 2 gait clock, forward speed (m/s), yaw rate (rad/s), and 2
+heading-error values. Positive speed is forward; positive yaw turns left.
+Lateral strafing is not a command.
+
+The default command ranges are **-40 to +80 mm/s** and **-0.60 to +0.60 rad/s**.
+These are training targets, not measured hardware capability. Configure
+`forward_velocity_range` and `yaw_rate_range` in `joystick.py` before training
+if a different range is needed. Training samples standing, straight walking,
+pivot turns, and combined motion, and changes the command every 3–6 seconds.
+Speed ramps at 50 mm/s² and yaw rate at 1 rad/s², with the same limits exported
+to firmware. Walking cadence stays fixed; foot shaping uses each foot's
+commanded translation and rotation. At zero speed **and** zero turn rate the
+reward blends to supported standing. Velocity tracking uses the body heading;
+heading and yaw penalties follow the turn command.
+
+After training, export the checkpoint with `export_policy.py`, rebuild with
+`pio run`, install the firmware, and reload Rick Control. Speed and steering
+ranges are read from the firmware's exported policy limits. **Start** ramps
+from rest to the selected setpoint. Slider changes apply during walking;
+**Straighten** zeros steering, and **Stand** zeros both commands while keeping
+the policy active. **Stop** immediately stops inference, holds the current
+servo pose, and clears the selected command. Bluetooth disconnection also
+stops inference. The checked-in weights remain the existing walking policy,
+so these new controls stay disabled until a command policy is exported.
+
+The control characteristic accepts opcode `6`, followed by signed little-endian
+int16 forward speed in mm/s and yaw rate in mrad/s (5 bytes total). Out-of-range
+packets are rejected. Its read status preserves the first three legacy bytes
+(state, sleep capability, wake error), followed by command version at byte 3;
+version 1 appends int16 speed min/max, yaw min/max, selected speed, and selected
+yaw at offsets 4, 6, 8, 10, 12, and 14. Limits must fit these integer units.
+Legacy policies report command version zero and continue using their trained
+fixed speed.
 
 ## Bluetooth standby
 
@@ -266,3 +333,13 @@ On hardware, verify in this order with the robot supported:
 Serve `bluetooth.html`, `manifest.webmanifest`, `service-worker.js`, and the
 `icons` directory together from an HTTPS static host. The cached app shell can
 open offline, but Bluetooth must still be enabled on the Android device.
+
+Command-control regression checks:
+
+```sh
+node tests/motion_controls_web_test.mjs
+c++ -std=c++17 -Wall -Wextra -Werror -I. tests/motion_control_test.cpp -o /tmp/rick-motion-test
+/tmp/rick-motion-test
+# In mujoco_playground, using its Python environment:
+python -m unittest mujoco_playground._src.locomotion.rick.motion_command_test
+```

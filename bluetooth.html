@@ -215,6 +215,15 @@
       font-weight: 780;
     }
 
+    .motion-controls { padding: 18px; border-bottom: 1px solid var(--line); }
+    .motion-controls label { display: flex; justify-content: space-between; gap: 12px; margin: 12px 0 6px; }
+    .motion-controls input { width: 100%; min-height: 44px; accent-color: var(--orange); }
+    #motionTurn { direction: rtl; } /* Moving the thumb left requests a left turn. */
+    .motion-controls output { color: var(--orange); font-variant-numeric: tabular-nums; }
+    .motion-actions { display: flex; gap: 10px; margin-top: 10px; }
+    .motion-actions button { padding: 10px 16px; border: 1px solid var(--line); border-radius: 12px; background: #292823; }
+    .motion-controls p { color: var(--muted); font-size: 0.82rem; line-height: 1.5; }
+
     .controls {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -590,6 +599,18 @@
         </div>
       </div>
 
+      <div class="motion-controls" aria-label="Speed and steering">
+        <label for="motionSpeed">Speed <output id="motionSpeedValue" for="motionSpeed">0 mm/s</output></label>
+        <input id="motionSpeed" type="range" min="0" max="0" step="1" value="0" disabled>
+        <label for="motionTurn">Steering <output id="motionTurnValue" for="motionTurn">Straight</output></label>
+        <input id="motionTurn" type="range" min="0" max="0" step="1" value="0" disabled>
+        <div class="motion-actions">
+          <button id="motionStraight" type="button" disabled>Straighten</button>
+          <button id="motionStand" type="button" disabled>Stand</button>
+        </div>
+        <p id="motionStatus" role="status">Connect to set speed and steering.</p>
+      </div>
+
       <div class="controls">
         <button class="command" data-command="0" type="button" disabled>
           <span class="command-number">01</span>
@@ -660,6 +681,22 @@
         <button class="small-button" data-axis-check="2" data-requires-connection type="button" disabled>Check +Z forward</button>
       </div>
       <p class="tool-note" id="imuResult" role="status">Connect to begin reading the IMU.</p>
+    </section>
+
+    <section class="card tool-card" aria-labelledby="gaitHeading">
+      <div class="tool-heading">
+        <div><h2 id="gaitHeading">First-step diagnostics</h2>
+          <p>IMU, attitude, and servo commands around Start.</p></div>
+      </div>
+      <p class="tool-note">Each Start records about half a second before motion and the first three gait cycles on Rick. Let it take a few steps, press Stop, then fetch the log. Fetch before the next Start or firmware update replaces it.</p>
+      <div class="axis-checks">
+        <button class="small-button primary" id="gaitFetch" type="button" disabled>Fetch last Start</button>
+        <button class="small-button" id="gaitJson" type="button" disabled>Save JSON</button>
+        <button class="small-button" id="gaitCsv" type="button" disabled>Save CSV</button>
+      </div>
+      <p class="tool-note" id="gaitStatus" role="status" aria-live="polite">Connect to check gait-log support.</p>
+      <pre class="code-output" id="gaitSummary" style="white-space:pre-wrap">After fetching, a short IMU and timing summary appears here.</pre>
+      <p class="tool-note">Log axes match the policy: X right, Y back, Z up. These differ from the live physical-axis display above. Servo values are commanded positions, not measured foot motion.</p>
     </section>
 
     <section class="card tool-card" aria-labelledby="rawHeading">
@@ -746,6 +783,8 @@
     <p class="safety">Support the robot off the ground during calibration and first use. Keep people and cables clear before pressing Start. A Bluetooth disconnect stops active motion. Sleep releases the servos; lay Rick down or support it first. Reconnecting alone does not wake it.</p>
   </main>
 
+  <script src="gait-diagnostics.js"></script>
+  <script src="motion-controls.js"></script>
   <script>
     "use strict";
 
@@ -801,10 +840,10 @@
     ];
 
     const servoNames = [
-      "Left roll", "Left upper", "Left lower", "Left foot",
-      "Right roll", "Right upper", "Right lower", "Right foot"
+      "Right roll", "Right upper", "Right lower", "Right foot",
+      "Left roll", "Left upper", "Left lower", "Left foot"
     ];
-    const servoPins = [10, 11, 12, 13, 6, 7, 8, 9];
+    const servoPins = [6, 7, 8, 9, 10, 11, 12, 13];
     const axisLabels = ["+X right", "+Y down", "+Z forward"];
 
     const stateLabels = [
@@ -899,6 +938,25 @@
     const verifiedAxes = new Set();
     const centeredServos = new Set();
     let deferredInstallPrompt = null;
+    let gaitDiagnostics = null;
+    const motionControls = new RickMotionControls({
+      speed: document.getElementById("motionSpeed"), turn: document.getElementById("motionTurn"),
+      speedValue: document.getElementById("motionSpeedValue"), turnValue: document.getElementById("motionTurnValue"),
+      straight: document.getElementById("motionStraight"), stand: document.getElementById("motionStand"),
+      status: document.getElementById("motionStatus"),
+    }, {
+      connected: isConnected,
+      locked: () => !isConnected() || busy || robotIsSleeping(),
+      error: text => setMessage(text, true),
+      write: (payload, valid) => {
+        const characteristic = controlCharacteristic;
+        return queueGattOperation(() => {
+          if (!valid() || characteristic !== controlCharacteristic || !isConnected()) return;
+          if (typeof characteristic.writeValueWithResponse === "function") return characteristic.writeValueWithResponse(payload);
+          return characteristic.writeValue(payload);
+        });
+      },
+    });
 
     function renderServoRows() {
       servoList.innerHTML = servoNames.map((name, index) => `
@@ -1027,6 +1085,8 @@
     }
 
     function updateButtons() {
+      if (typeof motionControls !== "undefined") motionControls.updateButtons();
+      if (typeof gaitDiagnostics !== "undefined" && gaitDiagnostics) gaitDiagnostics.updateButtons();
       const connectionLocked = !isConnected() || busy;
       const locked = connectionLocked || robotIsSleeping();
       commandButtons.forEach((button) => {
@@ -1096,6 +1156,7 @@
       const state = value.getUint8(0);
       sleepSupported = value.byteLength >= 2 && (value.getUint8(1) & 1) !== 0;
       lastWakeError = value.byteLength >= 3 ? value.getUint8(2) : 0;
+      if (typeof motionControls !== "undefined") motionControls.readStatus(value);
       showRobotState(state);
       return state;
     }
@@ -1772,6 +1833,7 @@
         imuCharacteristic = await service.getCharacteristic(IMU_UUID);
         servoCharacteristic = await service.getCharacteristic(SERVO_UUID);
         await discoverRawSupport(service);
+        await gaitDiagnostics.connect(service);
         try {
           batteryCharacteristic = await service.getCharacteristic(BATTERY_UUID);
         } catch (error) {
@@ -1911,6 +1973,8 @@
     }
 
     function handleDisconnect() {
+      motionControls.disconnect();
+      if (typeof gaitDiagnostics !== "undefined" && gaitDiagnostics) gaitDiagnostics.disconnect();
       const wasSleeping = robotIsSleeping();
       sleepSupported = false;
       if (rawInProgress) rawStatus.textContent = "Disconnected during capture. Previous results are kept; repeat this pose after reconnecting.";
@@ -2002,6 +2066,7 @@
         "Sleep and release all servos? Lay Rick down or support it first; it will no longer hold its pose."
       )) return;
 
+      if (typeof motionControls !== "undefined") motionControls.cancel();
       busy = true;
       stopImuPolling();
       showConnection("Sending…", commandMessages[command], "working");
@@ -2009,6 +2074,7 @@
       updateButtons();
 
       try {
+        if (command === 2 && typeof motionControls !== "undefined") await motionControls.prepareStart();
         const payload = Uint8Array.of(command);
         await writeWithResponse(controlCharacteristic, payload);
 
@@ -2239,6 +2305,13 @@
         });
       });
     }
+
+    gaitDiagnostics = new RickGaitDiagnostics.Controller({
+      connected: isConnected, busy: () => busy, sleeping: robotIsSleeping,
+      setBusy: value => { busy = value; updateButtons(); },
+      queue: queueGattOperation, readState: readRobotState,
+      stopPolling: stopImuPolling, startPolling: startImuPolling,
+    });
 
     if (!bluetoothSupported) {
       setMessage(
