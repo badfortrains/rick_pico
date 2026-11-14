@@ -173,23 +173,30 @@ definitions](GAIT_DIAGNOSTICS.md).
 
 ## Training speed and steering
 
-Train a **new** `RickJoystickFlatTerrain` run in `mujoco_playground`. Old
-checkpoints have a different observation contract and are rejected for restore.
-The default policy observation has 108 inputs: 96 servo-command history values,
+`RickJoystickFlatTerrain` now defaults to recovering straight walking at
+**50 mm/s**, then widens commands through explicit stages:
+`walk`, `speed`, `transitions`, `turns`, `full`. Select a stage with
+`--rick_command_stage` in `learning/train_jax_ppo.py`. Restore the successful
+checkpoint from the preceding stage before advancing. Compatible 107-input,
+heading-aware walking checkpoints can now warm-start the 108-input policy;
+conversion preserves their initial walking output and seeds command normalization.
+See [the training guide](../mujoco_playground/learning/RICK_COMMAND_TRAINING.md)
+for the recovery command, stage ranges, reward changes, and rollout checks.
+
+The policy observation has 108 inputs: 96 servo-command history values,
 3 gravity, 3 gyro, 2 gait clock, forward speed (m/s), yaw rate (rad/s), and 2
 heading-error values. Positive speed is forward; positive yaw turns left.
 Lateral strafing is not a command.
 
-The default command ranges are **-40 to +80 mm/s** and **-0.60 to +0.60 rad/s**.
-These are training targets, not measured hardware capability. Configure
-`forward_velocity_range` and `yaw_rate_range` in `joystick.py` before training
-if a different range is needed. Training samples standing, straight walking,
-pivot turns, and combined motion, and changes the command every 3–6 seconds.
-Speed ramps at 50 mm/s² and yaw rate at 1 rad/s², with the same limits exported
-to firmware. Walking cadence stays fixed; foot shaping uses each foot's
-commanded translation and rotation. At zero speed **and** zero turn rate the
-reward blends to supported standing. Velocity tracking uses the body heading;
-heading and yaw penalties follow the turn command.
+The `full` stage targets **-40 to +80 mm/s** and **-0.60 to +0.60 rad/s**.
+These are training targets, not measured hardware capability. Early stages use
+narrower ranges; exported limits include zero for startup. Speed ramps at
+50 mm/s² and yaw rate at 1 rad/s², with the same limits exported to firmware.
+Walking cadence stays fixed. Speed reward emphasizes cycle-average tracking,
+and swing progress requires a lifted foot with support from the other foot.
+At zero speed **and** zero turn rate the reward blends to supported standing.
+Velocity tracking uses the body heading; heading and yaw penalties follow the
+turn command.
 
 After training, export the checkpoint with `export_policy.py`, rebuild with
 `pio run`, install the firmware, and reload Rick Control. Speed and steering
@@ -198,8 +205,9 @@ from rest to the selected setpoint. Slider changes apply during walking;
 **Straighten** zeros steering, and **Stand** zeros both commands while keeping
 the policy active. **Stop** immediately stops inference, holds the current
 servo pose, and clears the selected command. Bluetooth disconnection also
-stops inference. The checked-in weights remain the existing walking policy,
-so these new controls stay disabled until a command policy is exported.
+stops inference. Legacy walking policies report command version zero and keep
+the new controls disabled; command policies enable controls within their
+exported stage limits.
 
 The control characteristic accepts opcode `6`, followed by signed little-endian
 int16 forward speed in mm/s and yaw rate in mrad/s (5 bytes total). Out-of-range
