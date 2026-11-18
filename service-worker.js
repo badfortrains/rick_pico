@@ -1,10 +1,9 @@
 "use strict";
 
-const CACHE_NAME = "rick-control-v18";
+const CACHE_NAME = "rick-control-v19";
 const APP_SHELL = [
   "./bluetooth.html",
   "./gait-diagnostics.js",
-  "./motion-controls.js",
   "./manifest.webmanifest",
   "./icons/rick-180.png",
   "./icons/rick-192.png",

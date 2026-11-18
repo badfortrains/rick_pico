@@ -118,14 +118,14 @@ beyond one slot.
 
 `policy_weights.h` contains the network parameters and deployment constants
 exported with the training run. The controller maintains command history,
-projected gravity, body-frame gyro, gait clock, commanded forward speed and
-turn rate, and heading error relative to the integrated turn command. Policy inference and servo updates run at the
+projected gravity, body-frame gyro, gait clock, fixed target velocity, and optional
+relative-heading observations. Policy inference and servo updates run at the
 exported 50 Hz control rate.
 
 The firmware continuously settles its Madgwick attitude estimate while
 stopped. Heading-aware policies capture a fresh relative heading when Start is
-pressed. Command policies integrate the smoothed turn rate into that reference,
-so steering holds the new heading when returned to zero. If gyro-bias calibration is enabled in the exported header, keep Rick
+pressed. That reference stays fixed while walking. If gyro-bias calibration is
+enabled in the exported header, keep Rick
 still for the reported calibration interval after boot.
 
 To export a different checkpoint, use the Python environment containing
@@ -154,7 +154,6 @@ The controller provides:
 - reset to the exported default pose;
 - reset every servo to its raw calibrated center pulse;
 - start and stop policy inference;
-- forward/reverse speed and left/right steering, plus Straighten and Stand;
 - live physical-frame accelerometer and gyro checks;
 - buffered first-step IMU/attitude/servo diagnostics, downloadable after Stop;
 - live battery-voltage monitoring from GPIO1 / ADC1 through the 3:1 divider;
@@ -171,52 +170,16 @@ after stopping, then **Save JSON**. Each Start automatically records pre-motion
 samples and the first three gait cycles. See [capture instructions and field
 definitions](GAIT_DIAGNOSTICS.md).
 
-## Training speed and steering
+## Straight-line walking
 
-`RickJoystickFlatTerrain` now defaults to recovering straight walking at
-**50 mm/s**, then widens commands through explicit stages:
-`walk`, `speed`, `transitions`, `turns`, `full`. Select a stage with
-`--rick_command_stage` in `learning/train_jax_ppo.py`. Restore the successful
-checkpoint from the preceding stage before advancing. Compatible 107-input,
-heading-aware walking checkpoints can now warm-start the 108-input policy;
-conversion preserves their initial walking output and seeds command normalization.
-See [the training guide](../mujoco_playground/learning/RICK_COMMAND_TRAINING.md)
-for the recovery command, stage ranges, reward changes, and rollout checks.
+The deployed policy uses a fixed forward target of **50 mm/s** and holds the
+heading captured at Start. Its 107 inputs are 96 servo-command history values,
+3 gravity, 3 gyro, 2 gait clock, the fixed target velocity, and 2 relative-heading
+values. Speed and steering controls are removed.
 
-The policy observation has 108 inputs: 96 servo-command history values,
-3 gravity, 3 gyro, 2 gait clock, forward speed (m/s), yaw rate (rad/s), and 2
-heading-error values. Positive speed is forward; positive yaw turns left.
-Lateral strafing is not a command.
-
-The `full` stage targets **-40 to +80 mm/s** and **-0.60 to +0.60 rad/s**.
-These are training targets, not measured hardware capability. Early stages use
-narrower ranges; exported limits include zero for startup. Speed ramps at
-50 mm/s² and yaw rate at 1 rad/s², with the same limits exported to firmware.
-Walking cadence stays fixed. Speed reward emphasizes cycle-average tracking,
-and swing progress requires a lifted foot with support from the other foot.
-At zero speed **and** zero turn rate the reward blends to supported standing.
-Velocity tracking uses the body heading; heading and yaw penalties follow the
-turn command.
-
-After training, export the checkpoint with `export_policy.py`, rebuild with
-`pio run`, install the firmware, and reload Rick Control. Speed and steering
-ranges are read from the firmware's exported policy limits. **Start** ramps
-from rest to the selected setpoint. Slider changes apply during walking;
-**Straighten** zeros steering, and **Stand** zeros both commands while keeping
-the policy active. **Stop** immediately stops inference, holds the current
-servo pose, and clears the selected command. Bluetooth disconnection also
-stops inference. Legacy walking policies report command version zero and keep
-the new controls disabled; command policies enable controls within their
-exported stage limits.
-
-The control characteristic accepts opcode `6`, followed by signed little-endian
-int16 forward speed in mm/s and yaw rate in mrad/s (5 bytes total). Out-of-range
-packets are rejected. Its read status preserves the first three legacy bytes
-(state, sleep capability, wake error), followed by command version at byte 3;
-version 1 appends int16 speed min/max, yaw min/max, selected speed, and selected
-yaw at offsets 4, 6, 8, 10, 12, and 14. Limits must fit these integer units.
-Legacy policies report command version zero and continue using their trained
-fixed speed.
+`policy_weights.h` restores the straight-walking checkpoint at step 73,728,000
+from `checkpoints/20261111-234527`. New training exports must use the same
+fixed-speed observation layout; 108-input speed/steering policies are incompatible.
 
 ## Bluetooth standby
 
@@ -341,13 +304,3 @@ On hardware, verify in this order with the robot supported:
 Serve `bluetooth.html`, `manifest.webmanifest`, `service-worker.js`, and the
 `icons` directory together from an HTTPS static host. The cached app shell can
 open offline, but Bluetooth must still be enabled on the Android device.
-
-Command-control regression checks:
-
-```sh
-node tests/motion_controls_web_test.mjs
-c++ -std=c++17 -Wall -Wextra -Werror -I. tests/motion_control_test.cpp -o /tmp/rick-motion-test
-/tmp/rick-motion-test
-# In mujoco_playground, using its Python environment:
-python -m unittest mujoco_playground._src.locomotion.rick.motion_command_test
-```
